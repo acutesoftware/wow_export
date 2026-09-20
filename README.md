@@ -1,6 +1,6 @@
 # WoW Time Capsule
 
-A local-first World of Warcraft archival exporter. Phase 1 includes a PySide6 GUI, browser OAuth, character discovery/manual entry, immutable snapshots, raw JSON preservation, SQLite indexing, archive README generation, a `wow.export` capability probe, and offline verification.
+A local-first World of Warcraft archival exporter. Phase 1 provides API snapshots and Phase 2 adds versioned `wow.export` bridge automation, character GLB export, default companion-pet GLB export, and checksummed asset preservation.
 
 Requires Python 3.12:
 
@@ -19,5 +19,7 @@ Verify an archive with:
 python -m wow_timecapsule.verify D:\GameArchives\WorldOfWarcraft
 ```
 
-This implements Phase 1 of [the specification](docs/spec_wow_export_v01.md). Automated 3D export, world extraction, and the Go/Three.js viewer belong to later phases.
+The 3D option requires a compatible loopback bridge implementing [the v1 bridge protocol](docs/BRIDGE_PROTOCOL.md). The application never automates the wow.export GUI. World extraction and the Go/Three.js viewer remain later phases.
+
+See the [user guide](docs/user_guide.md) for setup, exporting, verification, and an explanation of the mock bridge integration test.
 

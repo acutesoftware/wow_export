@@ -59,6 +59,7 @@ class BlizzardAPI:
             "character_profile": base,
             "achievements": base + "/achievements",
             "equipment": base + "/equipment",
+            "appearance": base + "/appearance",
             "pets": "/profile/user/wow/collections/pets",
             "mounts": "/profile/user/wow/collections/mounts",
             "professions": base + "/professions",
@@ -80,4 +81,3 @@ class BlizzardAPI:
         if failures:
             captured["_failures"] = failures
         return captured
-

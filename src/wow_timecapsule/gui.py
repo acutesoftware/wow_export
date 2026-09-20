@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 from PySide6.QtCore import QUrl
@@ -17,6 +18,7 @@ from .archive import Archive, now
 from .config import Config
 from .install import detect_products
 from .oauth import authorize
+from .model_spec import character_export_spec, default_pet, pet_display_id
 
 
 class Events(QObject):
@@ -48,6 +50,7 @@ class MainWindow(QMainWindow):
         self.archive_edit = self._path_row(layout, "Archive:", self.config.archive_path, True)
         layout.addWidget(QLabel("Battle.net")); row = QHBoxLayout(); self.connect_button = QPushButton("Connect Battle.net"); self.connect_button.clicked.connect(self.connect); row.addWidget(self.connect_button); self.status = QLabel("Status: Not Connected"); row.addWidget(self.status); row.addStretch(); layout.addLayout(row)
         layout.addWidget(QLabel("Characters")); self.table = QTableWidget(0, 4); self.table.setHorizontalHeaderLabels(["Realm", "Character", "Level", "Class"]); self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch); self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); layout.addWidget(self.table)
+        self.assets = QCheckBox("Export character GLB and default companion pet"); self.assets.setChecked(True); layout.addWidget(self.assets)
         controls = QHBoxLayout(); manual = QPushButton("Add Manual Character"); manual.clicked.connect(self.add_manual); controls.addWidget(manual); export = QPushButton("Export Selected Character"); export.clicked.connect(self.export_selected); controls.addWidget(export); open_archive = QPushButton("Open Archive"); open_archive.clicked.connect(self.open_archive); controls.addWidget(open_archive); controls.addStretch(); layout.addLayout(controls)
         self.message = QLabel(""); self.message.setWordWrap(True); layout.addWidget(self.message); self.setCentralWidget(root)
 
@@ -96,7 +99,7 @@ class MainWindow(QMainWindow):
         if not self.api or self.api.region != self.characters[row].region: self._error("Connect Battle.net for this character's region first."); return
         archive_path = self.archive_edit.text().strip()
         if not archive_path: self._error("Choose an archive folder first."); return
-        self.save_config(); char = self.characters[row]; self.message.setText("Exporting…")
+        self.save_config(); char = self.characters[row]; export_assets = self.assets.isChecked(); self.message.setText("Exporting…")
         products = detect_products(self.wow_edit.text()); product = products[0] if products else None
         def work():
             archive = None
@@ -106,7 +109,23 @@ class MainWindow(QMainWindow):
                     observed = now()
                     if self.account_raw:
                         archive.save_raw(run_id, "account", "/profile/user/wow", self.account_raw, 200, observed)
-                    captured = self.api.capture_character(char, lambda name, endpoint, payload, status: archive.save_raw(run_id, name, endpoint, payload, status, observed)); archive.import_capture(run_id, char, captured, observed)
+                    captured = self.api.capture_character(char, lambda name, endpoint, payload, status: archive.save_raw(run_id, name, endpoint, payload, status, observed))
+                    snapshot_id = archive.import_capture(run_id, char, captured, observed)
+                    if export_assets:
+                        if not probe.automation_available:
+                            raise RuntimeError("3D export requested, but no compatible wow-timecapsule-bridge/v1 service is running on 127.0.0.1:17890")
+                        if product is None:
+                            raise RuntimeError("3D export requested, but no supported WoW installation product was detected")
+                        adapter.open_installation(product.path, product.product)
+                        with tempfile.TemporaryDirectory(prefix="wow-timecapsule-") as staging:
+                            staging_root = Path(staging)
+                            spec = character_export_spec(char, captured)
+                            character_result = adapter.export_character(spec, staging_root / "character")
+                            archive.preserve_character_export(run_id, snapshot_id, char, observed, spec, character_result.files, character_result.metadata)
+                            pet = default_pet(captured)
+                            if pet:
+                                pet_result = adapter.export_creature(pet_display_id(pet), staging_root / "pet")
+                                archive.preserve_pet_export(run_id, snapshot_id, pet, pet_result.files, pet_result.metadata)
                 self.events.exported.emit(f"Exported {char.name} to {archive_path}")
             except Exception as exc: self.events.failure.emit(str(exc))
             finally:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -74,6 +75,124 @@ class Archive:
         self.db.execute("INSERT INTO raw_api_file(archive_run_id,endpoint,relative_path,sha256,http_status,observed_at) VALUES(?,?,?,?,?,?)", (run_id, endpoint, relative, sha256(target), status, observed))
         return relative
 
+    def add_asset(self, run_id: int, source: Path, destination: Path, *, asset_type: str,
+                  source_name: str, source_id: str | None = None) -> int:
+        """Copy an exported file into the archive and index its preservation metadata."""
+        source = source.resolve()
+        destination = destination.resolve()
+        if destination != self.root and self.root not in destination.parents:
+            raise ValueError("asset destination is outside archive")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source_checksum = sha256(source)
+        if destination.exists():
+            existing = self.db.execute(
+                "SELECT asset_id,sha256 FROM asset WHERE relative_path=?",
+                (destination.relative_to(self.root).as_posix(),),
+            ).fetchone()
+            if existing and existing[1] == source_checksum:
+                return int(existing[0])
+            stem, suffix = destination.stem, destination.suffix
+            counter = 2
+            while destination.exists():
+                destination = destination.with_name(f"{stem}_{counter}{suffix}"); counter += 1
+        if source != destination:
+            shutil.copy2(source, destination)
+        relative = destination.relative_to(self.root).as_posix()
+        checksum = source_checksum
+        cursor = self.db.execute(
+            "INSERT INTO asset(asset_type,relative_path,format,source,source_id,sha256,file_size,created_at,archive_run_id) VALUES(?,?,?,?,?,?,?,?,?)",
+            (asset_type, relative, destination.suffix.lower().lstrip("."), source_name, source_id,
+             checksum, destination.stat().st_size, now(), run_id),
+        )
+        return int(cursor.lastrowid)
+
+    def add_source_file(self, run_id: int, path: Path) -> None:
+        relative = path.resolve().relative_to(self.root).as_posix()
+        self.db.execute(
+            "INSERT INTO source_file(relative_path,sha256,file_size,archive_run_id) VALUES(?,?,?,?) ON CONFLICT(relative_path) DO UPDATE SET sha256=excluded.sha256,file_size=excluded.file_size,archive_run_id=excluded.archive_run_id",
+            (relative, sha256(path), path.stat().st_size, run_id),
+        )
+
+    def preserve_character_export(self, run_id: int, snapshot_id: int, character: CharacterRef,
+                                  observed: str, character_spec: dict, files: tuple[Path, ...],
+                                  bridge_metadata: dict) -> Path:
+        character_dir = self.root / "characters" / safe_name(
+            f"{character.region}_{character.realm_slug}_{character.name}"
+        )
+        stamp = observed.replace(":", "").replace("-", "")
+        snapshot_dir = character_dir / "snapshots" / stamp
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        descriptor = character_dir / "character.json"
+        descriptor.write_text(
+            json.dumps(character_spec, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        metadata_path = snapshot_dir / "source.json"
+        metadata_path.write_text(
+            json.dumps(self._portable_metadata(bridge_metadata), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        self.add_source_file(run_id, descriptor)
+        self.add_source_file(run_id, metadata_path)
+        primary: Path | None = None
+        used: set[str] = set()
+        for source in files:
+            name = self._unique_name(source.name, used)
+            destination = snapshot_dir / ("character.glb" if source.suffix.lower() == ".glb" and primary is None else name)
+            used.add(destination.name.lower())
+            asset_id = self.add_asset(run_id, source, destination, asset_type="character_model" if destination.suffix.lower() in {".glb", ".gltf", ".obj"} else "character_support", source_name="wow.export", source_id=str(character.character_id or character.name))
+            self.db.execute("INSERT INTO character_asset VALUES(?,?,?)", (snapshot_id, asset_id, "primary" if destination.name == "character.glb" else "support"))
+            if destination.name == "character.glb":
+                relative = self.db.execute("SELECT relative_path FROM asset WHERE asset_id=?", (asset_id,)).fetchone()[0]
+                primary = self.root / relative
+        if primary is None:
+            raise ValueError("character export has no GLB")
+        return primary
+
+    def preserve_pet_export(self, run_id: int, snapshot_id: int, pet_data: dict,
+                            files: tuple[Path, ...], bridge_metadata: dict) -> Path:
+        guid = str(pet_data.get("id") or pet_data.get("species", {}).get("id") or "unknown")
+        pet_dir = self.root / "assets" / "pets" / safe_name(guid)
+        pet_dir.mkdir(parents=True, exist_ok=True)
+        pet_path = pet_dir / "pet.json"; source_path = pet_dir / "source.json"
+        pet_path.write_text(json.dumps(pet_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        source_path.write_text(json.dumps(self._portable_metadata(bridge_metadata), ensure_ascii=False, indent=2), encoding="utf-8")
+        self.add_source_file(run_id, pet_path); self.add_source_file(run_id, source_path)
+        primary: Path | None = None
+        used: set[str] = set()
+        for source in files:
+            name = "pet.glb" if source.suffix.lower() == ".glb" and primary is None else self._unique_name(source.name, used)
+            used.add(name.lower()); destination = pet_dir / name
+            asset_id = self.add_asset(run_id, source, destination, asset_type="pet_model" if destination.suffix.lower() in {".glb", ".gltf", ".obj"} else "pet_support", source_name="wow.export", source_id=guid)
+            self.db.execute("INSERT INTO character_asset VALUES(?,?,?)", (snapshot_id, asset_id, "companion" if name == "pet.glb" else "pet_support"))
+            if name == "pet.glb":
+                relative = self.db.execute("SELECT relative_path FROM asset WHERE asset_id=?", (asset_id,)).fetchone()[0]
+                primary = self.root / relative
+        row = self.db.execute("SELECT pet_id FROM pet WHERE pet_guid=?", (guid,)).fetchone()
+        if row:
+            self.db.execute("UPDATE character_pet SET preserve_for_viewer=1 WHERE character_snapshot_id=? AND pet_id=?", (snapshot_id, row[0]))
+        if primary is None:
+            raise ValueError("pet export has no GLB")
+        return primary
+
+    @staticmethod
+    def _unique_name(name: str, used: set[str]) -> str:
+        candidate = safe_name(name)
+        stem, suffix = Path(candidate).stem, Path(candidate).suffix
+        counter = 2
+        while candidate.lower() in used:
+            candidate = f"{stem}_{counter}{suffix}"; counter += 1
+        return candidate
+
+    @classmethod
+    def _portable_metadata(cls, value: Any) -> Any:
+        """Remove machine-specific absolute paths from bridge operational metadata."""
+        if isinstance(value, dict):
+            return {key: cls._portable_metadata(item) for key, item in value.items() if key != "output_dir"}
+        if isinstance(value, list):
+            return [cls._portable_metadata(item) for item in value]
+        if isinstance(value, str) and Path(value).is_absolute():
+            return Path(value).name
+        return value
+
     def import_capture(self, run_id: int, character: CharacterRef, captured: dict[str, dict], observed: str | None = None) -> int:
         observed = observed or now()
         profile = captured["character_profile"]
@@ -96,7 +215,6 @@ class Archive:
         self._import_simple(snapshot, captured.get("reputations", {}), "reputation", observed)
         self._import_stats(snapshot, captured.get("statistics", {}), observed)
         self._import_quests(snapshot, captured.get("quests", {}), observed)
-        self.db.commit()
         return int(snapshot)
 
     def _raw_path(self, run_id: int, name: str) -> str | None:
@@ -164,5 +282,8 @@ class Archive:
         run = self.db.execute("SELECT completed_at,wow_client_build,wow_export_version FROM archive_run WHERE status='complete' ORDER BY archive_run_id DESC LIMIT 1").fetchone()
         lines = ["# WoW Time Capsule Archive", "", "This is a local, preservation-oriented archive. It contains original JSON responses and a standard SQLite index.", "", "## Characters", ""]
         lines += [f"- {name} — {realm or 'unknown realm'} ({region.upper()})" for name, realm, region in chars] or ["- None yet"]
-        lines += ["", "## Latest export", "", f"- Exported: {run[0] if run else 'unknown'}", f"- WoW client build: {(run[1] if run else None) or 'unknown'}", f"- wow.export version: {(run[2] if run else None) or 'not available'}", "- Exporter version: " + __version__, "", "## Opening and formats", "", "Open `wow_archive.sqlite` with any SQLite 3 browser. Raw Blizzard API responses are under `raw/api/` as UTF-8 JSON. Run `python -m wow_timecapsule.verify .` from this directory to verify integrity.", "", "## Limitations", "", "This archive records what supported APIs exposed at each observation time. It is not a complete historical activity log. Phase 1 does not include 3D assets or the offline viewer.", ""]
+        assets = self.db.execute("SELECT format,count(*) FROM asset GROUP BY format ORDER BY format").fetchall()
+        lines += ["", "## Latest export", "", f"- Exported: {run[0] if run else 'unknown'}", f"- WoW client build: {(run[1] if run else None) or 'unknown'}", f"- wow.export version: {(run[2] if run else None) or 'not available'}", "- Exporter version: " + __version__, "", "## Preserved asset formats", ""]
+        lines += [f"- {fmt.upper()}: {count}" for fmt, count in assets] or ["- No binary assets"]
+        lines += ["", "## Opening and formats", "", "Open `wow_archive.sqlite` with any SQLite 3 browser. Raw Blizzard API responses are under `raw/api/` as UTF-8 JSON. Character and pet models use GLB and can be opened by a generic glTF 2.0 viewer. Run `python -m wow_timecapsule.verify .` from this directory to verify integrity.", "", "## Limitations", "", "This archive records what supported APIs exposed at each observation time. It is not a complete historical activity log. 3D export requires a compatible localhost wow.export bridge; world extraction and the offline viewer are later phases.", ""]
         (self.root / "README.md").write_text("\n".join(lines), encoding="utf-8")

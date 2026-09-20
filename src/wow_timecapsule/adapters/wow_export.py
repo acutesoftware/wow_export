@@ -73,3 +73,9 @@ class WowExportAdapter:
     export_creature = open_installation
     export_map = open_installation
 
+
+# Phase 2 implementation. Kept here as a re-export so callers retain the adapter path
+# required by the archive specification while the versioned protocol stays explicit.
+from .wow_export_v2 import BridgeError, ExportResult, ProbeResult, WowExportAdapter  # noqa: E402,F811
+
+__all__ = ["BridgeError", "ExportResult", "ProbeResult", "WowExportAdapter"]

@@ -34,7 +34,9 @@ def verify(root: str | Path) -> tuple[bool, list[str]]:
         counts["Assets"] = db.execute("SELECT count(*) FROM asset").fetchone()[0]
         counts["Character models"] = db.execute("SELECT count(*) FROM asset WHERE asset_type='character_model'").fetchone()[0]
         counts["World scenes"] = db.execute("SELECT count(*) FROM map_export").fetchone()[0]
-        records = list(db.execute("SELECT relative_path,sha256 FROM raw_api_file")) + list(db.execute("SELECT relative_path,sha256 FROM asset"))
+        records = (list(db.execute("SELECT relative_path,sha256 FROM raw_api_file"))
+                   + list(db.execute("SELECT relative_path,sha256 FROM asset"))
+                   + list(db.execute("SELECT relative_path,sha256 FROM source_file")))
         for relative, expected in records:
             if Path(relative).is_absolute() or ".." in Path(relative).parts:
                 errors.append(f"Unsafe stored path: {relative}"); continue
