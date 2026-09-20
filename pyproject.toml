@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wow-timecapsule"
+version = "0.1.0"
+description = "Local-first World of Warcraft character archival tool"
+requires-python = ">=3.12"
+dependencies = ["httpx>=0.27,<1", "PySide6>=6.7,<7"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+wow-timecapsule = "wow_timecapsule.__main__:main"
+wow-timecapsule-verify = "wow_timecapsule.verify:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+wow_timecapsule = ["schema.sql"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

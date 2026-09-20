@@ -214,5 +214,11 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# Generated WoW Time Capsule archives and local credentials
+archive/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
 # Streamlit
 .streamlit/secrets.toml
