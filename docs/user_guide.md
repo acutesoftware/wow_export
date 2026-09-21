@@ -27,11 +27,13 @@ WoW Time Capsule can currently:
 - preserve the original API JSON;
 - create repeatable, non-destructive SQLite snapshots;
 - request character and pet GLB exports from a compatible wow.export bridge;
+- export a small manually selected set of ADT map tiles, including terrain, placed WMO/M2 objects, textures, and source metadata;
+- generate a versioned, portable `scene.json` with a chosen spawn point;
 - preserve and checksum files returned by that bridge;
 - generate an archive README;
 - verify that an archive remains internally consistent.
 
-The application does not yet include the Phase 3 world exporter or Phase 4 offline 3D viewer.
+The application does not yet include the Phase 4 offline 3D viewer.
 
 ## Requirements
 
@@ -150,6 +152,16 @@ If no compatible pet display ID is available, the character can still be exporte
 
 The exact bridge request and response format is documented in [BRIDGE_PROTOCOL.md](BRIDGE_PROTOCOL.md).
 
+## Export a small world area
+
+1. Start the compatible bridge and choose the WoW installation, wow.export, and archive paths.
+2. Click **Export World Area**.
+3. Enter the numeric map ID and one or more ADT coordinates as `x,y`, separated by semicolons.
+4. Give the place a meaningful name and enter `x,y,z,heading` for its viewer spawn point.
+5. Confirm the export.
+
+The UI limits one request to 16 tiles. Begin with one tile and expand only when needed. The archive stores original bridge output beneath `world/<name>/`, classifies geometry as terrain or placed objects using bridge metadata, retains textures and metadata, and creates the stable `scene.json` used by future viewers.
+
 ## Archive layout
 
 A typical archive looks like:
@@ -182,6 +194,13 @@ WorldOfWarcraft/
                 pet.json
                 pet.glb
                 source.json
+    world/
+        stormwind_trade_district/
+            scene.json
+            terrain/
+            objects/
+            textures/
+            source/
 ```
 
 All paths stored in SQLite are relative to the archive root. Local installation paths may appear in diagnostic run information but are not used as permanent asset paths.
@@ -240,4 +259,3 @@ Read each `ERROR:` line in the verifier output. A missing-file error means an in
 - Do not publish an archive without reviewing its raw profile data.
 - Do not commit generated archives or Blizzard game assets to the public source repository.
 - Back up the entire archive directory, including SQLite, raw JSON, models, metadata, and its README.
-

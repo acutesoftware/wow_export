@@ -72,16 +72,22 @@ def _check_glb(path: Path, errors: list[str]) -> None:
 
 
 def _check_scene(root: Path, relative: str, errors: list[str]) -> None:
-    path = root / relative
+    path = (root / relative).resolve()
+    if path != root and root not in path.parents:
+        errors.append(f"Unsafe scene path: {relative}"); return
     try:
         scene = json.loads(path.read_text(encoding="utf-8"))
-        if scene.get("format") != "wow-timecapsule-scene": errors.append(f"Invalid scene: {relative}")
+        if scene.get("format") != "wow-timecapsule-scene" or scene.get("version") != 1:
+            errors.append(f"Invalid scene: {relative}")
+        spawn = scene.get("spawn")
+        if not isinstance(spawn, dict) or not all(isinstance(spawn.get(key), (int, float)) for key in ("x", "y", "z", "heading")):
+            errors.append(f"Invalid scene spawn: {relative}")
         for group in ("terrain", "objects"):
             for item in scene.get(group, []):
                 ref = item.get("path") if isinstance(item, dict) else item
                 if ref and str(ref).lower().startswith(("http://", "https://")):
                     errors.append(f"External rendering dependency: {ref}")
-                elif ref and (Path(ref).is_absolute() or not (path.parent / ref).exists()):
+                elif ref and (Path(ref).is_absolute() or path.parent not in (path.parent / ref).resolve().parents or not (path.parent / ref).is_file()):
                     errors.append(f"Broken scene reference: {ref}")
     except (OSError, ValueError): errors.append(f"Unreadable scene: {relative}")
 

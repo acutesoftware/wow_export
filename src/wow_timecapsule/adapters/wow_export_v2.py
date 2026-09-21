@@ -85,18 +85,22 @@ class WowExportAdapter:
         })
 
     def export_character(self, character_spec: dict, output_dir: Path) -> ExportResult:
-        return self._export("/v1/exports/character", {"character": character_spec}, output_dir)
+        return self._export("/v1/exports/character", {"character": character_spec}, output_dir, "glb")
 
     def export_creature(self, display_id: int, output_dir: Path) -> ExportResult:
-        return self._export("/v1/exports/creature", {"display_id": display_id}, output_dir)
+        return self._export("/v1/exports/creature", {"display_id": display_id}, output_dir, "glb")
 
     def export_map(self, map_id: int, tiles: list[dict], output_dir: Path) -> ExportResult:
-        return self._export("/v1/exports/map", {"map_id": map_id, "tiles": tiles}, output_dir)
+        if map_id < 0:
+            raise ValueError("map_id must be non-negative")
+        if not tiles:
+            raise ValueError("at least one map tile is required")
+        return self._export("/v1/exports/map", {"map_id": map_id, "tiles": tiles}, output_dir, "obj")
 
-    def _export(self, endpoint: str, values: dict, output_dir: Path) -> ExportResult:
+    def _export(self, endpoint: str, values: dict, output_dir: Path, format_name: str) -> ExportResult:
         output_dir.mkdir(parents=True, exist_ok=True)
         response = self._request("POST", endpoint, {
-            "interface": self.INTERFACE, "output_dir": str(output_dir.resolve()), "format": "glb", **values,
+            "interface": self.INTERFACE, "output_dir": str(output_dir.resolve()), "format": format_name, **values,
         }, timeout=600)
         if response.get("status") != "complete":
             raise BridgeError(response.get("error") or "bridge export did not complete")
@@ -109,8 +113,10 @@ class WowExportAdapter:
             if not candidate.is_file():
                 raise BridgeError(f"bridge output is missing: {value}")
             files.append(candidate)
-        if not any(path.suffix.lower() == ".glb" for path in files):
+        if format_name == "glb" and not any(path.suffix.lower() == ".glb" for path in files):
             raise BridgeError("bridge did not produce a GLB")
+        if format_name == "obj" and not any(path.suffix.lower() in {".obj", ".glb", ".gltf"} for path in files):
+            raise BridgeError("bridge did not produce terrain geometry")
         return ExportResult(tuple(files), response)
 
     def _request(self, method: str, endpoint: str, payload: dict | None = None, timeout: float = 2) -> dict:
@@ -121,4 +127,3 @@ class WowExportAdapter:
         if not isinstance(result, dict):
             raise BridgeError("bridge returned a non-object response")
         return result
-

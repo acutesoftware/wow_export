@@ -19,6 +19,7 @@ from .config import Config
 from .install import detect_products
 from .oauth import authorize
 from .model_spec import character_export_spec, default_pet, pet_display_id
+from .world import MapTile, SpawnPoint
 
 
 class Events(QObject):
@@ -52,6 +53,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Characters")); self.table = QTableWidget(0, 4); self.table.setHorizontalHeaderLabels(["Realm", "Character", "Level", "Class"]); self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch); self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); layout.addWidget(self.table)
         self.assets = QCheckBox("Export character GLB and default companion pet"); self.assets.setChecked(True); layout.addWidget(self.assets)
         controls = QHBoxLayout(); manual = QPushButton("Add Manual Character"); manual.clicked.connect(self.add_manual); controls.addWidget(manual); export = QPushButton("Export Selected Character"); export.clicked.connect(self.export_selected); controls.addWidget(export); open_archive = QPushButton("Open Archive"); open_archive.clicked.connect(self.open_archive); controls.addWidget(open_archive); controls.addStretch(); layout.addLayout(controls)
+        world = QPushButton("Export World Area"); world.clicked.connect(self.export_world); controls.insertWidget(2, world)
         self.message = QLabel(""); self.message.setWordWrap(True); layout.addWidget(self.message); self.setCentralWidget(root)
 
     def _path_row(self, parent: QVBoxLayout, label: str, value: str, directory: bool) -> QLineEdit:
@@ -127,6 +129,52 @@ class MainWindow(QMainWindow):
                                 pet_result = adapter.export_creature(pet_display_id(pet), staging_root / "pet")
                                 archive.preserve_pet_export(run_id, snapshot_id, pet, pet_result.files, pet_result.metadata)
                 self.events.exported.emit(f"Exported {char.name} to {archive_path}")
+            except Exception as exc: self.events.failure.emit(str(exc))
+            finally:
+                if archive: archive.close()
+        threading.Thread(target=work, daemon=True).start()
+
+    def export_world(self) -> None:
+        dialog = QDialog(self); dialog.setWindowTitle("World Locations")
+        form = QFormLayout(dialog); map_id = QLineEdit("0"); tiles = QLineEdit("32,32")
+        name = QLineEdit("Small test area"); spawn = QLineEdit("0,0,0,0")
+        form.addRow("Map ID", map_id); form.addRow("Tiles (x,y; x,y)", tiles)
+        form.addRow("Name", name); form.addRow("Spawn (x,y,z,heading)", spawn)
+        note = QLabel("Choose only a small number of adjacent ADT tiles. Whole-continent exports are intentionally unsupported.")
+        note.setWordWrap(True); form.addRow(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); form.addRow(buttons)
+        if not dialog.exec(): return
+        try:
+            selected_tiles = [MapTile(*(int(part.strip()) for part in value.split(",")))
+                              for value in tiles.text().split(";") if value.strip()]
+            spawn_values = [float(value.strip()) for value in spawn.text().split(",")]
+            if len(spawn_values) != 4 or not selected_tiles: raise ValueError
+            if len(selected_tiles) > 16: raise ValueError("Select at most 16 tiles")
+            selected_map = int(map_id.text()); selected_name = name.text().strip()
+            if selected_map < 0 or not selected_name: raise ValueError
+            selected_spawn = SpawnPoint(*spawn_values)
+        except (TypeError, ValueError) as exc:
+            self._error(str(exc) or "Enter a valid map ID, name, tile list, and four-value spawn point."); return
+        archive_path = self.archive_edit.text().strip()
+        products = detect_products(self.wow_edit.text()); product = products[0] if products else None
+        if not archive_path or product is None:
+            self._error("Choose an archive folder and a supported WoW installation first."); return
+        self.save_config(); self.message.setText("Exporting world area…")
+        def work():
+            archive = None
+            try:
+                archive = Archive(archive_path); adapter = WowExportAdapter(self.export_edit.text())
+                probe = adapter.write_diagnostic(archive.root / "logs" / f"wow_export_probe_{now().replace(':', '')}.json")
+                if not probe.automation_available: raise RuntimeError("No compatible localhost wow.export bridge is running.")
+                adapter.open_installation(product.path, product.product)
+                with archive.run(region=self.config.region, locale=self.config.locale, product=product.product,
+                                 build=product.version, wow_export_version=probe.version) as run_id:
+                    with tempfile.TemporaryDirectory(prefix="wow-timecapsule-map-") as staging:
+                        result = adapter.export_map(selected_map, [tile.as_bridge_value() for tile in selected_tiles], Path(staging))
+                        archive.preserve_map_export(run_id, selected_map, selected_name, product.version,
+                                                    result.files, result.metadata, selected_spawn)
+                self.events.exported.emit(f"Exported {selected_name} to {archive_path}")
             except Exception as exc: self.events.failure.emit(str(exc))
             finally:
                 if archive: archive.close()

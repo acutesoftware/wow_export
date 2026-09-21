@@ -12,6 +12,7 @@ from typing import Any, Iterator
 
 from . import __version__
 from .api import CharacterRef
+from .world import SpawnPoint, scene_entry
 
 
 def now() -> str:
@@ -173,6 +174,67 @@ class Archive:
             raise ValueError("pet export has no GLB")
         return primary
 
+    def preserve_map_export(self, run_id: int, map_id: int, name: str, source_build: str,
+                            files: tuple[Path, ...], bridge_metadata: dict,
+                            spawn: SpawnPoint | None = None) -> Path:
+        """Preserve one deliberately bounded map export and write its stable scene manifest."""
+        if map_id < 0:
+            raise ValueError("map_id must be non-negative")
+        if not name.strip():
+            raise ValueError("map export name is required")
+        scene_dir = self.root / "world" / safe_name(name)
+        if scene_dir.exists():
+            base = scene_dir
+            counter = 2
+            while scene_dir.exists():
+                scene_dir = base.with_name(f"{base.name}_{counter}")
+                counter += 1
+        scene_dir.mkdir(parents=True)
+        self.db.execute("INSERT OR IGNORE INTO map(map_id,name) VALUES(?,?)", (map_id, name.strip()))
+        map_export_id = self.db.execute(
+            "INSERT INTO map_export(map_id,archive_run_id,name,observed_at) VALUES(?,?,?,?)",
+            (map_id, run_id, name.strip(), now()),
+        ).lastrowid
+
+        terrain: list[dict] = []
+        objects: list[dict] = []
+        metadata_by_file = {
+            str(item.get("path")): item for item in bridge_metadata.get("entries", [])
+            if isinstance(item, dict) and item.get("path")
+        }
+        used: set[str] = set()
+        for source in files:
+            suffix = source.suffix.lower()
+            if suffix in {".obj", ".glb", ".gltf"}:
+                category = "objects" if metadata_by_file.get(source.name, {}).get("kind") in {"wmo", "m2", "object"} else "terrain"
+            elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".tga", ".blp", ".mtl"}:
+                category = "textures"
+            else:
+                category = "source"
+            name_on_disk = self._unique_name(source.name, used)
+            used.add(name_on_disk.lower())
+            destination = scene_dir / category / name_on_disk
+            asset_id = self.add_asset(run_id, source, destination, asset_type=f"world_{category.rstrip('s')}", source_name="wow.export", source_id=str(map_id))
+            self.db.execute("INSERT INTO map_asset VALUES(?,?)", (map_export_id, asset_id))
+            if category in {"terrain", "objects"}:
+                relative = destination.relative_to(scene_dir).as_posix()
+                metadata = metadata_by_file.get(source.name) or metadata_by_file.get(str(source))
+                (terrain if category == "terrain" else objects).append(scene_entry(relative, metadata))
+
+        source_path = scene_dir / "source" / "bridge-response.json"
+        source_path.parent.mkdir(exist_ok=True)
+        source_path.write_text(json.dumps(self._portable_metadata(bridge_metadata), ensure_ascii=False, indent=2), encoding="utf-8")
+        self.add_source_file(run_id, source_path)
+        scene = {"format": "wow-timecapsule-scene", "version": 1, "name": name.strip(),
+                 "map_id": map_id, "source_build": source_build, "terrain": terrain,
+                 "objects": objects, "spawn": (spawn or SpawnPoint()).as_dict()}
+        scene_path = scene_dir / "scene.json"
+        scene_path.write_text(json.dumps(scene, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.add_source_file(run_id, scene_path)
+        relative_scene = scene_path.relative_to(self.root).as_posix()
+        self.db.execute("UPDATE map_export SET scene_path=? WHERE map_export_id=?", (relative_scene, map_export_id))
+        return scene_path
+
     @staticmethod
     def _unique_name(name: str, used: set[str]) -> str:
         candidate = safe_name(name)
@@ -285,5 +347,5 @@ class Archive:
         assets = self.db.execute("SELECT format,count(*) FROM asset GROUP BY format ORDER BY format").fetchall()
         lines += ["", "## Latest export", "", f"- Exported: {run[0] if run else 'unknown'}", f"- WoW client build: {(run[1] if run else None) or 'unknown'}", f"- wow.export version: {(run[2] if run else None) or 'not available'}", "- Exporter version: " + __version__, "", "## Preserved asset formats", ""]
         lines += [f"- {fmt.upper()}: {count}" for fmt, count in assets] or ["- No binary assets"]
-        lines += ["", "## Opening and formats", "", "Open `wow_archive.sqlite` with any SQLite 3 browser. Raw Blizzard API responses are under `raw/api/` as UTF-8 JSON. Character and pet models use GLB and can be opened by a generic glTF 2.0 viewer. Run `python -m wow_timecapsule.verify .` from this directory to verify integrity.", "", "## Limitations", "", "This archive records what supported APIs exposed at each observation time. It is not a complete historical activity log. 3D export requires a compatible localhost wow.export bridge; world extraction and the offline viewer are later phases.", ""]
+        lines += ["", "## Opening and formats", "", "Open `wow_archive.sqlite` with any SQLite 3 browser. Raw Blizzard API responses are under `raw/api/` as UTF-8 JSON. Character and pet models use GLB. World areas are under `world/`; each `scene.json` is the stable entry point and preserves terrain, objects, textures, and original exporter metadata. Run `python -m wow_timecapsule.verify .` from this directory to verify integrity.", "", "## Limitations", "", "This archive records what supported APIs exposed at each observation time. It is not a complete historical activity log. 3D export requires a compatible localhost wow.export bridge. World export is intentionally limited to small, manually selected areas; the offline viewer is a later phase.", ""]
         (self.root / "README.md").write_text("\n".join(lines), encoding="utf-8")

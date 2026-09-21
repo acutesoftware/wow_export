@@ -34,5 +34,19 @@ The response is `{"status":"ready"}` or an HTTP error with a JSON `error` value.
 
 `POST /v1/exports/creature` receives `interface`, `output_dir`, `format`, and `display_id`. Its response has the same shape as character export.
 
-The bridge must finish writing and close all files before responding. It must never accept remote connections. Map export is reserved at `POST /v1/exports/map` for Phase 3.
+The bridge must finish writing and close all files before responding. It must never accept remote connections.
 
+## Export map tiles
+
+`POST /v1/exports/map` receives `interface`, an absolute temporary `output_dir`,
+`format: "obj"`, a numeric `map_id`, and a non-empty `tiles` array containing `x`
+and `y` ADT coordinates. It returns every generated terrain, WMO/M2 object, texture,
+placement, heightmap, and metadata file:
+
+```json
+{"status":"complete","files":["tile_32_32.obj","terrain.png","placements.json"],"entries":[{"path":"tile_32_32.obj","kind":"terrain","tile":{"x":32,"y":32}}]}
+```
+
+An `entries` item with `kind` equal to `wmo`, `m2`, or `object` is represented in
+the stable scene manifest as a placed object. Other model files are terrain. Entry
+metadata may include `position`, `rotation`, `scale`, `tile`, and `source_id`.
