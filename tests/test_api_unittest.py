@@ -117,6 +117,44 @@ class BlizzardAPITests(unittest.TestCase):
         self.assertEqual(captured["_outcomes"]["hunter_pets"]["status"], "unavailable")
         self.assertIsNone(captured["_outcomes"]["hunter_pets"]["count"])
 
+    def test_completed_achievement_reference_details_are_downloaded(self):
+        api = BlizzardAPI.__new__(BlizzardAPI)
+        api.region = "us"
+        api.locale = "en_US"
+        requested = []
+        saved = []
+
+        def fake_get(path, namespace="profile"):
+            requested.append((path, namespace))
+            if path.endswith("/achievements"):
+                return {"achievements": [
+                    {"achievement": {"id": 6, "name": "Level 10"},
+                     "completed_timestamp": 1_700_000_000_000},
+                    {"achievement": {"id": 7, "name": "Not complete"},
+                     "criteria": {"is_completed": False}},
+                ]}, 200
+            if path == "/data/wow/achievement/6":
+                return {
+                    "id": 6, "name": "Level 10", "description": "Reach level 10.",
+                    "criteria": {"description": "Reach level 10"},
+                }, 200
+            return {}, 200
+
+        api.get = fake_get
+        character = CharacterRef("us", 1, "realm", "Realm", 42, "Example")
+        captured = api.capture_character(
+            character, lambda *args: saved.append(args), set()
+        )
+
+        self.assertIn(("/data/wow/achievement/6", "static"), requested)
+        self.assertNotIn(("/data/wow/achievement/7", "static"), requested)
+        self.assertEqual(
+            captured["achievements"]["_reference_details"]["6"]["description"],
+            "Reach level 10.",
+        )
+        self.assertEqual(captured["_outcomes"]["achievement_details"]["count"], 1)
+        self.assertTrue(any(item[0] == "achievement_details" for item in saved))
+
 
 if __name__ == "__main__":
     unittest.main()

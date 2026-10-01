@@ -39,7 +39,9 @@ class Archive:
         self._migrate_character_identity()
         schema = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
         self.db.executescript(schema)
+        self._migrate_achievement_reference_columns()
         self._migrate_legacy_collections()
+        self._backfill_profession_tiers()
         screenshot_columns = {
             row[1] for row in self.db.execute("PRAGMA table_info(screenshot)")
         }
@@ -47,6 +49,46 @@ class Archive:
             self.db.execute("ALTER TABLE screenshot ADD COLUMN sha256 TEXT")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.commit()
+
+    def _migrate_achievement_reference_columns(self) -> None:
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(achievement)")}
+        additions = {
+            "requirements": "TEXT",
+            "reward_description": "TEXT",
+            "is_account_wide": "INTEGER",
+            "display_order": "INTEGER",
+            "reference_json": "TEXT",
+        }
+        for name, column_type in additions.items():
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE achievement ADD COLUMN {name} {column_type}")
+
+    def _backfill_profession_tiers(self) -> None:
+        """Re-import preserved profession JSON from archives made before tier support."""
+        rows = self.db.execute("""
+            SELECT archive_run_id,relative_path,observed_at
+            FROM raw_api_file WHERE relative_path LIKE '%_professions.json'
+        """).fetchall()
+        for run_id, relative_path, observed_at in rows:
+            relative = Path(relative_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            source = self.root / relative
+            if not source.is_file():
+                continue
+            try:
+                data = json.loads(source.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            snapshots = self.db.execute(
+                "SELECT character_snapshot_id,observed_at FROM character_snapshot "
+                "WHERE archive_run_id=?",
+                (run_id,),
+            ).fetchall()
+            for snapshot_id, snapshot_observed in snapshots:
+                self._import_professions(
+                    int(snapshot_id), data, snapshot_observed or observed_at or now()
+                )
 
     def _migrate_character_identity(self) -> None:
         exists = self.db.execute(
@@ -182,7 +224,7 @@ class Archive:
         mounts_outcome = outcomes.get("mounts") or ({"status": "captured", "count": len(captured["mounts"].get("mounts", []))} if "mounts" in captured else {})
         self._import_account_collection(run_id, "pets", captured.get("pets", {}), pets_outcome, observed)
         self._import_account_collection(run_id, "mounts", captured.get("mounts", {}), mounts_outcome, observed)
-        self._import_simple(snapshot, captured.get("professions", {}), "profession", observed)
+        self._import_professions(snapshot, captured.get("professions", {}), observed)
         self._import_simple(snapshot, captured.get("reputations", {}), "reputation", observed)
         self._import_stats(snapshot, captured.get("statistics", {}), observed)
         self._import_quests(snapshot, captured.get("quests", {}), observed)
@@ -194,13 +236,73 @@ class Archive:
         return row[0] if row else None
 
     def _import_achievements(self, sid: int, data: dict, observed: str) -> None:
+        references = data.get("_reference_details", {})
         for item in data.get("achievements", []):
             detail = item.get("achievement", item)
             aid = detail.get("id")
             if aid is None: continue
-            self.db.execute("INSERT OR IGNORE INTO achievement(achievement_id,name,description,points,category) VALUES(?,?,?,?,?)", (aid, detail.get("name"), item.get("description"), item.get("points"), str(item.get("category", ""))))
+            reference = references.get(str(aid), references.get(aid, {}))
+            category = reference.get("category", item.get("category", {}))
+            category_name = category.get("name") if isinstance(category, dict) else str(category or "")
+            self.db.execute("""
+                INSERT INTO achievement(
+                    achievement_id,name,description,points,category,requirements,
+                    reward_description,is_account_wide,display_order,reference_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(achievement_id) DO UPDATE SET
+                    name=COALESCE(excluded.name,achievement.name),
+                    description=COALESCE(excluded.description,achievement.description),
+                    points=COALESCE(excluded.points,achievement.points),
+                    category=COALESCE(NULLIF(excluded.category,''),achievement.category),
+                    requirements=COALESCE(excluded.requirements,achievement.requirements),
+                    reward_description=COALESCE(excluded.reward_description,achievement.reward_description),
+                    is_account_wide=COALESCE(excluded.is_account_wide,achievement.is_account_wide),
+                    display_order=COALESCE(excluded.display_order,achievement.display_order),
+                    reference_json=COALESCE(excluded.reference_json,achievement.reference_json)
+            """, (
+                aid, reference.get("name") or detail.get("name"),
+                reference.get("description") or item.get("description"),
+                reference.get("points", item.get("points")), category_name,
+                self._achievement_requirements(reference.get("criteria", {})),
+                reference.get("reward_description"),
+                int(bool(reference.get("is_account_wide"))) if "is_account_wide" in reference else None,
+                reference.get("display_order"),
+                json.dumps(reference, ensure_ascii=False) if reference else None,
+            ))
             completed = item.get("completed_timestamp")
-            self.db.execute("INSERT OR IGNORE INTO character_achievement VALUES(?,?,?,?,?,?)", (sid, aid, int(bool(completed or item.get("is_completed"))), str(completed) if completed else None, json.dumps(item.get("criteria")) if item.get("criteria") else None, observed))
+            criteria = item.get("criteria", {})
+            is_completed = bool(
+                completed or item.get("is_completed") or
+                (criteria.get("is_completed") if isinstance(criteria, dict) else False)
+            )
+            self.db.execute("INSERT OR IGNORE INTO character_achievement VALUES(?,?,?,?,?,?)", (sid, aid, int(is_completed), str(completed) if completed else None, json.dumps(criteria) if criteria else None, observed))
+
+    @staticmethod
+    def _achievement_requirements(criteria: Any) -> str | None:
+        if not isinstance(criteria, dict) or not criteria:
+            return None
+        lines: list[str] = []
+        description = criteria.get("description")
+        amount = criteria.get("amount")
+        if description:
+            lines.append(str(description))
+        elif amount:
+            lines.append(f"Complete {amount} required objective(s)")
+        for child in criteria.get("child_criteria", []):
+            if not isinstance(child, dict):
+                continue
+            child_text = child.get("description") or child.get("name")
+            child_amount = child.get("amount")
+            if child_text:
+                lines.append(f"{child_text}{f' ({child_amount})' if child_amount else ''}")
+        return "\n".join(dict.fromkeys(lines)) or None
+
+    def achievement_reference_ids(self) -> set[int]:
+        return {
+            int(row[0]) for row in self.db.execute(
+                "SELECT achievement_id FROM achievement WHERE reference_json IS NOT NULL"
+            )
+        }
 
     def _import_equipment(self, sid: int, data: dict, observed: str) -> None:
         for item in data.get("equipped_items", []):
@@ -299,16 +401,57 @@ class Archive:
         return destination
 
     def _import_simple(self, sid: int, data: dict, kind: str, observed: str) -> None:
-        keys = ("primaries", "secondaries") if kind == "profession" else ("reputations",)
+        keys = ("reputations",)
         for key in keys:
             for item in data.get(key, []):
                 obj = item.get(kind, item.get("faction", item)); oid = obj.get("id")
                 if oid is None: continue
                 self.db.execute(f"INSERT OR IGNORE INTO {kind} VALUES(?,?)", (oid, obj.get("name")))
-                if kind == "profession":
-                    self.db.execute("INSERT OR IGNORE INTO character_profession VALUES(?,?,?,?,?)", (sid, oid, item.get("skill_points"), item.get("max_skill_points"), observed))
+                self.db.execute("INSERT OR IGNORE INTO character_reputation VALUES(?,?,?,?,?)", (sid, oid, str(item.get("standing", {}).get("name", "")), item.get("standing", {}).get("value"), observed))
+
+    def _import_professions(self, sid: int, data: dict, observed: str) -> None:
+        for group in ("primaries", "secondaries"):
+            for item in data.get(group, []):
+                profession = item.get("profession", item)
+                profession_id = profession.get("id")
+                if profession_id is None:
+                    continue
+                self.db.execute(
+                    "INSERT INTO profession(profession_id,name) VALUES(?,?) "
+                    "ON CONFLICT(profession_id) DO UPDATE SET "
+                    "name=COALESCE(excluded.name,profession.name)",
+                    (profession_id, profession.get("name")),
+                )
+                tiers = item.get("tiers", [])
+                if tiers:
+                    total_skill = sum(int(tier.get("skill_points") or 0) for tier in tiers)
+                    total_max = sum(int(tier.get("max_skill_points") or 0) for tier in tiers)
                 else:
-                    self.db.execute("INSERT OR IGNORE INTO character_reputation VALUES(?,?,?,?,?)", (sid, oid, str(item.get("standing", {}).get("name", "")), item.get("standing", {}).get("value"), observed))
+                    total_skill = item.get("skill_points")
+                    total_max = item.get("max_skill_points")
+                self.db.execute(
+                    "INSERT OR REPLACE INTO character_profession VALUES(?,?,?,?,?)",
+                    (sid, profession_id, total_skill, total_max, observed),
+                )
+                for tier_item in tiers:
+                    tier = tier_item.get("tier", tier_item)
+                    tier_id = tier.get("id")
+                    if tier_id is None:
+                        continue
+                    self.db.execute(
+                        "INSERT INTO profession_tier(profession_tier_id,profession_id,name) "
+                        "VALUES(?,?,?) ON CONFLICT(profession_tier_id) DO UPDATE SET "
+                        "profession_id=excluded.profession_id,"
+                        "name=COALESCE(excluded.name,profession_tier.name)",
+                        (tier_id, profession_id, tier.get("name")),
+                    )
+                    recipes = tier_item.get("known_recipes", [])
+                    self.db.execute(
+                        "INSERT OR REPLACE INTO character_profession_tier VALUES(?,?,?,?,?,?,?)",
+                        (sid, tier_id, tier_item.get("skill_points"),
+                         tier_item.get("max_skill_points"), len(recipes), observed,
+                         json.dumps(tier_item, ensure_ascii=False)),
+                    )
 
     def _import_stats(self, sid: int, data: dict, observed: str) -> None:
         for name, value in data.items():

@@ -111,8 +111,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
         self.tabs = QTabWidget()
         self.view_tab = self._build_view_tab()
+        self.timeline_tab = self._build_timeline_tab()
         self.export_tab = self._build_export_tab()
         self.tabs.addTab(self.view_tab, "View")
+        self.tabs.addTab(self.timeline_tab, "Timeline")
         self.tabs.addTab(self.export_tab, "Export")
         layout.addWidget(self.tabs)
         self.setCentralWidget(root)
@@ -157,6 +159,28 @@ class MainWindow(QMainWindow):
             QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True
         )
         layout.addWidget(self.viewer, 1)
+        return tab
+
+    def _build_timeline_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Archive:"))
+        self.timeline_archive_edit = QLineEdit(self.config.archive_path)
+        row.addWidget(self.timeline_archive_edit)
+        browse = QPushButton("Browse")
+        browse.clicked.connect(lambda: self._choose_archive(self.timeline_archive_edit))
+        row.addWidget(browse)
+        refresh = QPushButton("Refresh Timeline")
+        refresh.clicked.connect(self._refresh_from_timeline)
+        row.addWidget(refresh)
+        layout.addLayout(row)
+        self.timeline_viewer = QWebEngineView()
+        self.timeline_viewer.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True
+        )
+        self.timeline_viewer.loadFinished.connect(self._timeline_loaded)
+        layout.addWidget(self.timeline_viewer, 1)
         return tab
 
     def _build_export_tab(self) -> QWidget:
@@ -223,6 +247,7 @@ class MainWindow(QMainWindow):
 
     def _set_archive_path(self, path: str) -> None:
         self.view_archive_edit.setText(path)
+        self.timeline_archive_edit.setText(path)
         self.export_archive_edit.setText(path)
         self.config.archive_path = path
         self.config.save()
@@ -375,6 +400,7 @@ class MainWindow(QMainWindow):
                             lambda name, endpoint, payload, status: archive.save_raw(
                                 run_id, name, endpoint, payload, status, observed
                             ),
+                            archive.achievement_reference_ids(),
                         )
                         snapshot_id = archive.import_capture(run_id, char, captured, observed)
                         sections = archive.capture_summary(snapshot_id)
@@ -447,12 +473,14 @@ class MainWindow(QMainWindow):
         path = Path(self.view_archive_edit.text().strip())
         database = path / "wow_archive.sqlite"
         if not database.is_file():
-            self.viewer.setHtml(
+            empty = (
                 "<html><body style='font:16px Segoe UI;background:#111722;color:#e8edf6;"
-                "padding:40px'><h2>Choose an existing archive</h2><p>The View tab works "
-                "without Battle.net credentials. Select a folder containing "
+                "padding:40px'><h2>Choose an existing archive</h2><p>View and Timeline "
+                "work without Battle.net credentials. Select a folder containing "
                 "<code>wow_archive.sqlite</code>.</p></body></html>"
             )
+            self.viewer.setHtml(empty)
+            self.timeline_viewer.setHtml(empty)
             self.view_character_combo.clear()
             return
         try:
@@ -460,9 +488,20 @@ class MainWindow(QMainWindow):
             archive.close()
             html_path = generate_html(path)
             self.viewer.setUrl(QUrl.fromLocalFile(str(html_path)))
+            self.timeline_viewer.setUrl(QUrl.fromLocalFile(str(html_path)))
             self._load_view_characters(database)
         except Exception as exc:
             self._error(f"Could not open archive: {exc}")
+
+    def _timeline_loaded(self, successful: bool) -> None:
+        if successful:
+            self.timeline_viewer.page().runJavaScript(
+                "if (typeof timeline === 'function') timeline()"
+            )
+
+    def _refresh_from_timeline(self) -> None:
+        self._set_archive_path(self.timeline_archive_edit.text().strip())
+        self.refresh_view()
 
     def _load_view_characters(self, database: Path) -> None:
         db = sqlite3.connect(database)

@@ -170,6 +170,10 @@ class ArchiveTests(unittest.TestCase):
                     UNIQUE(region, realm_slug, character_name)
                 );
                 INSERT INTO character VALUES(1,42,'us',1,'realm','Realm','Legacy','a','b');
+                CREATE TABLE achievement (
+                    achievement_id INTEGER PRIMARY KEY, name TEXT, description TEXT,
+                    points INTEGER, category TEXT
+                );
             """)
             db.close()
             archive = Archive(folder)
@@ -177,7 +181,101 @@ class ArchiveTests(unittest.TestCase):
                 "SELECT character_name,namespace FROM character WHERE character_id=1"
             ).fetchone()
             self.assertEqual(row, ("Legacy", "profile"))
+            achievement_columns = {
+                row[1] for row in archive.db.execute("PRAGMA table_info(achievement)")
+            }
+            self.assertIn("requirements", achievement_columns)
+            self.assertIn("reference_json", achievement_columns)
             archive.close()
+
+    def test_profession_tiers_achievement_details_and_timeline(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive = Archive(root)
+            character = CharacterRef("us", 1, "realm", "Realm", 42, "Smith")
+            captured = {
+                "character_profile": {
+                    "level": 80, "last_login_timestamp": 1_700_000_000_000,
+                },
+                "achievements": {
+                    "achievements": [{
+                        "achievement": {"id": 6, "name": "Level 10"},
+                        "completed_timestamp": 1_600_000_000_000,
+                    }],
+                    "_reference_details": {"6": {
+                        "id": 6, "name": "Level 10", "description": "Reach level 10.",
+                        "points": 10, "category": {"name": "Character"},
+                        "criteria": {"description": "Reach level 10"},
+                        "reward_description": "A fine tabard", "is_account_wide": False,
+                    }},
+                },
+                "professions": {"primaries": [{
+                    "profession": {"id": 164, "name": "Blacksmithing"},
+                    "tiers": [{
+                        "tier": {"id": 2822, "name": "Khaz Algar Blacksmithing"},
+                        "skill_points": 75, "max_skill_points": 100,
+                        "known_recipes": [{"id": 1}, {"id": 2}],
+                    }],
+                }]},
+                "_outcomes": {
+                    "character_profile": {"status": "captured", "count": 1},
+                    "achievements": {"status": "captured", "count": 1},
+                    "achievement_details": {"status": "captured", "count": 1},
+                    "professions": {"status": "captured", "count": 1},
+                },
+            }
+            with archive.run(region="us", locale="en_US") as run_id:
+                archive.save_raw(
+                    run_id, "professions", "/professions", captured["professions"], 200,
+                    "2026-10-02T00:00:00Z",
+                )
+                snapshot_id = archive.import_capture(
+                    run_id, character, captured, "2026-10-02T00:00:00Z"
+                )
+            character_id = archive.db.execute(
+                "SELECT character_id FROM character WHERE character_name='Smith'"
+            ).fetchone()[0]
+            archive.add_memory(character_id, "The old forge", "Made my first sword.")
+            image = root / "forge.png"
+            image.write_bytes(b"image")
+            archive.add_screenshot(character_id, image, "At the forge")
+            tier = archive.db.execute("""
+                SELECT p.name,pt.name,cpt.skill_points,cpt.max_skill_points,cpt.known_recipes
+                FROM character_profession_tier cpt
+                JOIN profession_tier pt ON pt.profession_tier_id=cpt.profession_tier_id
+                JOIN profession p ON p.profession_id=pt.profession_id
+                WHERE cpt.character_snapshot_id=?
+            """, (snapshot_id,)).fetchone()
+            self.assertEqual(
+                tier, ("Blacksmithing", "Khaz Algar Blacksmithing", 75, 100, 2)
+            )
+            achievement = archive.db.execute(
+                "SELECT description,requirements,reward_description FROM achievement WHERE achievement_id=6"
+            ).fetchone()
+            self.assertEqual(
+                achievement, ("Reach level 10.", "Reach level 10", "A fine tabard")
+            )
+            archive.db.execute("DELETE FROM character_profession_tier")
+            archive.db.commit()
+            archive.close()
+
+            archive = Archive(root)
+            self.assertEqual(
+                archive.db.execute(
+                    "SELECT count(*) FROM character_profession_tier"
+                ).fetchone()[0],
+                1,
+            )
+            archive.close()
+
+            page = generate_html(root).read_text(encoding="utf-8")
+            self.assertIn("Khaz Algar Blacksmithing", page)
+            self.assertIn("How to earn it", page)
+            self.assertIn("A fine tabard", page)
+            self.assertIn('"kind": "played"', page)
+            self.assertIn('"kind": "achievement"', page)
+            self.assertIn('"kind": "screenshot"', page)
+            self.assertIn('"kind": "memory"', page)
 
     def test_legacy_character_collections_migrate_to_shared_collections(self):
         with tempfile.TemporaryDirectory() as folder:

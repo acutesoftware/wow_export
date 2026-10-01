@@ -81,7 +81,11 @@ class BlizzardAPI:
             raw["_failures"] = failures
         return characters, raw, status
 
-    def capture_character(self, character: CharacterRef, save: Callable[[str, str, dict, int], None]) -> dict[str, dict]:
+    def capture_character(
+        self, character: CharacterRef,
+        save: Callable[[str, str, dict, int], None],
+        known_achievement_ids: set[int] | None = None,
+    ) -> dict[str, dict]:
         base = f"/profile/wow/character/{character.realm_slug.lower()}/{character.name.lower()}"
         endpoints = {
             "character_profile": (base, character.namespace),
@@ -134,10 +138,68 @@ class BlizzardAPI:
                 "add the character manually with the correct version. Original error: "
                 f"{failures.get('character_profile', 'unknown error')}"
             )
+        if "achievements" in captured:
+            reference_outcome = self._capture_achievement_references(
+                captured["achievements"], character.namespace, save,
+                known_achievement_ids or set(),
+            )
+            outcomes["achievement_details"] = reference_outcome
         if failures:
             captured["_failures"] = failures
         captured["_outcomes"] = outcomes
         return captured
+
+    def _capture_achievement_references(
+        self, achievements: dict[str, Any], profile_namespace: str,
+        save: Callable[[str, str, dict, int], None], known_ids: set[int],
+    ) -> dict[str, Any]:
+        completed_ids: set[int] = set()
+        for item in achievements.get("achievements", []):
+            detail = item.get("achievement", item)
+            criteria = item.get("criteria", {})
+            completed = bool(
+                item.get("completed_timestamp") or item.get("is_completed") or
+                (criteria.get("is_completed") if isinstance(criteria, dict) else False)
+            )
+            if completed and detail.get("id") is not None:
+                completed_ids.add(int(detail["id"]))
+
+        cache: dict[int, dict[str, Any]] = getattr(self, "_achievement_cache", {})
+        self._achievement_cache = cache
+        details: dict[str, dict[str, Any]] = {}
+        failed: list[str] = []
+        static_namespace = profile_namespace.replace("profile", "static", 1)
+        for achievement_id in sorted(completed_ids - known_ids):
+            if achievement_id in cache:
+                details[str(achievement_id)] = cache[achievement_id]
+                continue
+            endpoint = f"/data/wow/achievement/{achievement_id}"
+            try:
+                reference, _status = self.get(endpoint, static_namespace)
+                cache[achievement_id] = reference
+                details[str(achievement_id)] = reference
+            except httpx.HTTPError as exc:
+                failed.append(f"{achievement_id}: {exc}")
+        if details:
+            save(
+                "achievement_details", "/data/wow/achievement/{id}",
+                {"achievements": details}, 200,
+            )
+            achievements["_reference_details"] = details
+        reused = len(completed_ids & known_ids)
+        detail_parts = []
+        if reused:
+            detail_parts.append(f"Reused {reused} reference records already in the archive.")
+        if failed:
+            detail_parts.append(
+                f"{len(failed)} reference request(s) failed: " + "; ".join(failed[:3])
+            )
+        status = "request_failed" if completed_ids and not details and not reused else "captured"
+        return {
+            "status": status,
+            "count": len(completed_ids) - len(failed),
+            "detail": " ".join(detail_parts),
+        }
 
     @staticmethod
     def _record_count(name: str, data: dict[str, Any]) -> int | None:

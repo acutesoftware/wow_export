@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS character_snapshot (
 );
 CREATE TABLE IF NOT EXISTS equipment (equipment_id INTEGER PRIMARY KEY, blizzard_item_id INTEGER, name TEXT, slot_type TEXT, UNIQUE(blizzard_item_id, slot_type));
 CREATE TABLE IF NOT EXISTS character_equipment (character_snapshot_id INTEGER REFERENCES character_snapshot, equipment_id INTEGER REFERENCES equipment, observed_at TEXT NOT NULL, raw_json TEXT, PRIMARY KEY(character_snapshot_id, equipment_id));
-CREATE TABLE IF NOT EXISTS achievement (achievement_id INTEGER PRIMARY KEY, name TEXT, description TEXT, points INTEGER, category TEXT);
+CREATE TABLE IF NOT EXISTS achievement (achievement_id INTEGER PRIMARY KEY, name TEXT, description TEXT, points INTEGER, category TEXT, requirements TEXT, reward_description TEXT, is_account_wide INTEGER, display_order INTEGER, reference_json TEXT);
 CREATE TABLE IF NOT EXISTS character_achievement (character_snapshot_id INTEGER REFERENCES character_snapshot, achievement_id INTEGER REFERENCES achievement, is_completed INTEGER, completed_at TEXT, criteria TEXT, observed_at TEXT NOT NULL, PRIMARY KEY(character_snapshot_id, achievement_id));
 CREATE TABLE IF NOT EXISTS pet (pet_id INTEGER PRIMARY KEY, pet_guid TEXT, species_id INTEGER, display_id INTEGER, creature_id INTEGER, name TEXT, custom_name TEXT, UNIQUE(pet_guid));
 CREATE TABLE IF NOT EXISTS mount (mount_id INTEGER PRIMARY KEY, name TEXT);
@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS collection_mount (collection_snapshot_id INTEGER REFE
 CREATE TABLE IF NOT EXISTS character_hunter_pet (character_snapshot_id INTEGER REFERENCES character_snapshot, pet_key TEXT, name TEXT, species_id INTEGER, creature_id INTEGER, display_id INTEGER, level INTEGER, slot INTEGER, is_active INTEGER, raw_json TEXT, PRIMARY KEY(character_snapshot_id, pet_key));
 CREATE TABLE IF NOT EXISTS profession (profession_id INTEGER PRIMARY KEY, name TEXT);
 CREATE TABLE IF NOT EXISTS character_profession (character_snapshot_id INTEGER REFERENCES character_snapshot, profession_id INTEGER REFERENCES profession, skill_points INTEGER, max_skill_points INTEGER, observed_at TEXT NOT NULL, PRIMARY KEY(character_snapshot_id, profession_id));
+CREATE TABLE IF NOT EXISTS profession_tier (profession_tier_id INTEGER PRIMARY KEY, profession_id INTEGER REFERENCES profession, name TEXT);
+CREATE TABLE IF NOT EXISTS character_profession_tier (character_snapshot_id INTEGER REFERENCES character_snapshot, profession_tier_id INTEGER REFERENCES profession_tier, skill_points INTEGER, max_skill_points INTEGER, known_recipes INTEGER, observed_at TEXT NOT NULL, raw_json TEXT, PRIMARY KEY(character_snapshot_id, profession_tier_id));
 CREATE TABLE IF NOT EXISTS reputation (reputation_id INTEGER PRIMARY KEY, name TEXT);
 CREATE TABLE IF NOT EXISTS character_reputation (character_snapshot_id INTEGER REFERENCES character_snapshot, reputation_id INTEGER REFERENCES reputation, standing TEXT, value INTEGER, observed_at TEXT NOT NULL, PRIMARY KEY(character_snapshot_id, reputation_id));
 CREATE TABLE IF NOT EXISTS currency (currency_id INTEGER PRIMARY KEY, name TEXT);

@@ -12,6 +12,7 @@ Warcraft installation or export game assets, models, maps, or textures.
 | What the app can do | What you need to do |
 |---|---|
 | View an existing character album | Select an archive folder. No Battle.net client or sign-in is needed. |
+| Browse the archive timeline | Open **Timeline**. It combines dated achievements, screenshots, notes, archive captures, and Blizzard's last-login time when available. |
 | Rebuild `index.html` from saved data | Select the archive and click **Rebuild HTML**. No API request is made. |
 | Add your own screenshots and notes | Open the archive in **View**, select a character, then use **Add Screenshot** or **Add Note**. |
 | Verify an archive | Run the verification command. No Battle.net client or sign-in is needed. |
@@ -21,11 +22,11 @@ Warcraft installation or export game assets, models, maps, or textures.
 The app has two tabs:
 
 ```text
-View (default)                         Export
-|-- choose an existing archive        |-- connect to Battle.net
-|-- browse characters/collections     |-- select one or more characters
-|-- add screenshots and notes         |-- export available API records
-`-- rebuild/open the HTML album        `-- review every section's result
+View (default)              Timeline                  Export
+|-- character album         |-- achievements          |-- connect to Battle.net
+|-- shared collections      |-- screenshots/notes     |-- select characters
+|-- screenshots and notes   |-- archive/last login    |-- export API records
+`-- rebuild/open HTML       `-- filter event types    `-- review results
 ```
 
 The Battle.net developer credentials are the **client ID and client secret**
@@ -97,6 +98,12 @@ an archive-specific README, and a local `index.html` album. Depending on what
 Blizzard exposes, a snapshot can include profile, appearance, equipment,
 achievements, hunter pets, account pets, account mounts, professions,
 reputations, statistics, and completed quests.
+
+For completed achievements, the first export also requests Blizzard's static
+achievement reference records. These add the description, points, category,
+requirements, reward, account-wide flag, and original reference JSON to SQLite.
+Reference records already stored in the archive are reused, so later exports do
+not request them again. The first enriched export can therefore take longer.
 
 Each successful export creates a new snapshot. Earlier snapshots and raw
 responses are not replaced.
@@ -174,6 +181,43 @@ archive is opened; another API export is not required for that migration.
 **Open in Browser** opens the same album outside the desktop app. Its data,
 styles, and scripts are embedded in `index.html`; screenshots use relative
 paths under the archive. It works directly from disk and makes no web requests.
+
+### Professions
+
+Professions are stored with their individual expansion skill tiers rather than
+only a single total. The View shows each tier's current and maximum skill and,
+when Blizzard supplies it, the number of known recipes. If the section is empty,
+check **Archive details**: Classic versions may not expose the same profession
+endpoint as Retail. Opening an older archive automatically rebuilds profession
+tiers from its preserved `_professions.json` files, so this fix does not require
+another API export when those files are already present.
+
+### Achievement details
+
+Select an achievement in View to expand its saved description, completion date,
+category, requirements, reward, and account-wide status. Blizzard's character
+response supplies completion progress and time; the separate Game Data record
+supplies the descriptive reference information. If Blizzard has not published
+a reference record for an achievement, the completion remains saved and the
+missing detail is reported in Capture results.
+
+## Timeline
+
+The top-level **Timeline** tab reads the selected archive without connecting to
+Battle.net. It combines:
+
+- achievement completion dates;
+- screenshots, using the date they were added to the archive;
+- personal notes and memories;
+- successful character capture dates; and
+- Blizzard's reported last-login time, when present in the profile response.
+
+Use the event-type list to filter the timeline. Blizzard does not provide a
+complete history of login sessions or hours played, so **Last played** is a
+single reported timestamp—not a reconstructed play log. Repeated exports can
+add more capture points but do not manufacture missing play dates. Account-wide
+achievements are labelled and de-duplicated rather than being attributed to
+every character whose profile reports the same completion.
 
 ## Pets and mounts
 
