@@ -17,6 +17,12 @@ class OAuthError(RuntimeError):
     pass
 
 
+CALLBACK_HOST = "127.0.0.1"
+CALLBACK_PORT = 17891
+CALLBACK_PATH = "/callback"
+CALLBACK_URL = f"http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}"
+
+
 def authorize(region: str, client_id: str, client_secret: str, timeout: int = 180) -> dict:
     """Run browser authorization-code + PKCE flow; tokens are returned in memory only."""
     verifier = secrets.token_urlsafe(64)
@@ -45,8 +51,14 @@ def authorize(region: str, client_id: str, client_secret: str, timeout: int = 18
         def log_message(self, *_args: object) -> None:
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    redirect_uri = f"http://127.0.0.1:{server.server_port}/callback"
+    try:
+        server = ThreadingHTTPServer((CALLBACK_HOST, CALLBACK_PORT), Handler)
+    except OSError as exc:
+        raise OAuthError(
+            f"Cannot start the Battle.net sign-in callback on {CALLBACK_URL}. "
+            "Close any other program using port 17891 and try again."
+        ) from exc
+    redirect_uri = CALLBACK_URL
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     params = urlencode({

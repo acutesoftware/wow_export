@@ -7,6 +7,12 @@ import httpx
 
 
 REGION_HOSTS = {"us": "us.api.blizzard.com", "eu": "eu.api.blizzard.com", "kr": "kr.api.blizzard.com", "tw": "tw.api.blizzard.com"}
+PROFILE_NAMESPACES = ("profile", "profile-classic", "profile-classic1x")
+PROFILE_LABELS = {
+    "profile": "Retail",
+    "profile-classic": "Classic progression",
+    "profile-classic1x": "Classic Era / Hardcore / seasonal",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +25,11 @@ class CharacterRef:
     name: str
     level: int | None = None
     playable_class: str = ""
+    namespace: str = "profile"
+
+    @property
+    def game_version(self) -> str:
+        return PROFILE_LABELS.get(self.namespace, self.namespace)
 
 
 class BlizzardAPI:
@@ -41,17 +52,32 @@ class BlizzardAPI:
         return response.json(), response.status_code
 
     def discover_characters(self) -> tuple[list[CharacterRef], dict[str, Any], int]:
-        data, status = self.get("/profile/user/wow")
         characters: list[CharacterRef] = []
-        for account in data.get("wow_accounts", []):
-            for char in account.get("characters", []):
-                realm = char.get("realm", {})
-                characters.append(CharacterRef(
-                    self.region, realm.get("id"), realm.get("slug", ""), realm.get("name", ""),
-                    char.get("id"), char.get("name", ""), char.get("level"),
-                    char.get("playable_class", {}).get("name", ""),
-                ))
-        return characters, data, status
+        sources: dict[str, dict[str, Any]] = {}
+        failures: dict[str, str] = {}
+        status = 200
+        for namespace in PROFILE_NAMESPACES:
+            qualified = f"{namespace}-{self.region}"
+            try:
+                data, status = self.get("/profile/user/wow", namespace)
+            except httpx.HTTPError as exc:
+                if namespace == "profile":
+                    raise
+                failures[qualified] = str(exc)
+                continue
+            sources[qualified] = data
+            for account in data.get("wow_accounts", []):
+                for char in account.get("characters", []):
+                    realm = char.get("realm", {})
+                    characters.append(CharacterRef(
+                        self.region, realm.get("id"), realm.get("slug", ""), realm.get("name", ""),
+                        char.get("id"), char.get("name", ""), char.get("level"),
+                        char.get("playable_class", {}).get("name", ""), namespace,
+                    ))
+        raw: dict[str, Any] = {"namespaces": sources}
+        if failures:
+            raw["_failures"] = failures
+        return characters, raw, status
 
     def capture_character(self, character: CharacterRef, save: Callable[[str, str, dict, int], None]) -> dict[str, dict]:
         base = f"/profile/wow/character/{character.realm_slug.lower()}/{character.name.lower()}"
@@ -71,13 +97,20 @@ class BlizzardAPI:
         failures: dict[str, str] = {}
         for name, endpoint in endpoints.items():
             try:
-                data, status = self.get(endpoint)
+                data, status = self.get(endpoint, character.namespace)
                 save(name, endpoint, data, status)
                 captured[name] = data
             except httpx.HTTPError as exc:
                 failures[name] = str(exc)
         if "character_profile" not in captured:
-            raise RuntimeError(f"Profile request failed: {failures.get('character_profile', 'unknown error')}")
+            namespace = f"{character.namespace}-{self.region}"
+            raise RuntimeError(
+                f"Blizzard has no profile for {character.name} — {character.realm_name or character.realm_slug} "
+                f"in {character.game_version} ({namespace}). The account list can contain deleted, "
+                "renamed, transferred, or not-yet-published characters. If the game version is wrong, "
+                "add the character manually with the correct version. Original error: "
+                f"{failures.get('character_profile', 'unknown error')}"
+            )
         if failures:
             captured["_failures"] = failures
         return captured

@@ -28,6 +28,18 @@ class Events(QObject):
     failure = Signal(str)
 
 
+SORT_VALUE_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+
+
+class SortableTableWidgetItem(QTableWidgetItem):
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        left = self.data(SORT_VALUE_ROLE)
+        right = other.data(SORT_VALUE_ROLE)
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return left < right
+        return str(left or "").casefold() < str(right or "").casefold()
+
+
 class CredentialsDialog(QDialog):
     def __init__(self, config: Config, parent=None):
         super().__init__(parent); self.setWindowTitle("Battle.net application")
@@ -43,15 +55,15 @@ class CredentialsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__(); self.setWindowTitle("WoW Time Capsule"); self.resize(850, 600)
-        self.config = Config.load(); self.token: dict | None = None; self.api: BlizzardAPI | None = None; self.characters: list[CharacterRef] = []; self.account_raw: dict = {}
+        self.config = Config.load(); self.token: dict | None = None; self.api: BlizzardAPI | None = None; self.characters: list[CharacterRef] = []; self.account_raw: dict = {}; self.sort_column: int | None = None; self.sort_order = Qt.SortOrder.AscendingOrder
         self.events = Events(); self.events.connected.connect(self._connected); self.events.exported.connect(self._exported); self.events.failure.connect(self._error)
         root = QWidget(); layout = QVBoxLayout(root); title = QLabel("WoW Time Capsule"); title.setStyleSheet("font-size: 22px; font-weight: bold"); layout.addWidget(title)
         self.wow_edit = self._path_row(layout, "WoW Installation:", self.config.wow_path, True)
         self.export_edit = self._path_row(layout, "wow.export:", self.config.wow_export_path, False)
         self.archive_edit = self._path_row(layout, "Archive:", self.config.archive_path, True)
         layout.addWidget(QLabel("Battle.net")); row = QHBoxLayout(); self.connect_button = QPushButton("Connect Battle.net"); self.connect_button.clicked.connect(self.connect); row.addWidget(self.connect_button); self.status = QLabel("Status: Not Connected"); row.addWidget(self.status); row.addStretch(); layout.addLayout(row)
-        layout.addWidget(QLabel("Characters")); self.table = QTableWidget(0, 4); self.table.setHorizontalHeaderLabels(["Realm", "Character", "Level", "Class"]); self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch); self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); layout.addWidget(self.table)
-        self.assets = QCheckBox("Export character GLB and default companion pet"); self.assets.setChecked(True); layout.addWidget(self.assets)
+        layout.addWidget(QLabel("Characters")); self.table = QTableWidget(0, 5); self.table.setHorizontalHeaderLabels(["Game", "Realm", "Character", "Level", "Class"]); self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch); self.table.horizontalHeader().setSortIndicatorShown(False); self.table.horizontalHeader().sectionClicked.connect(self._sort_by_column); self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); layout.addWidget(self.table)
+        self.assets = QCheckBox("Also export character/pet GLB (requires bridge-enabled wow.export)"); self.assets.setChecked(False); layout.addWidget(self.assets)
         controls = QHBoxLayout(); manual = QPushButton("Add Manual Character"); manual.clicked.connect(self.add_manual); controls.addWidget(manual); export = QPushButton("Export Selected Character"); export.clicked.connect(self.export_selected); controls.addWidget(export); open_archive = QPushButton("Open Archive"); open_archive.clicked.connect(self.open_archive); controls.addWidget(open_archive); controls.addStretch(); layout.addLayout(controls)
         world = QPushButton("Export World Area"); world.clicked.connect(self.export_world); controls.insertWidget(2, world)
         self.message = QLabel(""); self.message.setWordWrap(True); layout.addWidget(self.message); self.setCentralWidget(root)
@@ -88,20 +100,40 @@ class MainWindow(QMainWindow):
     def _populate(self) -> None:
         self.table.setRowCount(len(self.characters))
         for row, char in enumerate(self.characters):
-            for col, value in enumerate((char.realm_name, char.name, char.level or "", char.playable_class)):
-                item = QTableWidgetItem(str(value)); item.setData(Qt.ItemDataRole.UserRole, row); self.table.setItem(row, col, item)
+            for col, value in enumerate((char.game_version, char.realm_name, char.name, char.level, char.playable_class)):
+                item = SortableTableWidgetItem("" if value is None else str(value)); item.setData(Qt.ItemDataRole.UserRole, row); item.setData(SORT_VALUE_ROLE, value); self.table.setItem(row, col, item)
+        if self.sort_column is not None:
+            self.table.sortItems(self.sort_column, self.sort_order)
+
+    def _sort_by_column(self, column: int) -> None:
+        if column == self.sort_column:
+            self.sort_order = (
+                Qt.SortOrder.DescendingOrder
+                if self.sort_order == Qt.SortOrder.AscendingOrder
+                else Qt.SortOrder.AscendingOrder
+            )
+        else:
+            self.sort_column = column
+            self.sort_order = Qt.SortOrder.AscendingOrder
+        self.table.sortItems(column, self.sort_order)
+        self.table.horizontalHeader().setSortIndicator(column, self.sort_order)
+        self.table.horizontalHeader().setSortIndicatorShown(True)
 
     def add_manual(self) -> None:
-        dialog = QDialog(self); dialog.setWindowTitle("Manual character"); form = QFormLayout(dialog); region = QComboBox(); region.addItems(["us", "eu", "kr", "tw"]); region.setCurrentText(self.config.region); realm = QLineEdit(); name = QLineEdit(); form.addRow("Region", region); form.addRow("Realm slug", realm); form.addRow("Character name", name); buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel); buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); form.addRow(buttons)
-        if dialog.exec() and realm.text().strip() and name.text().strip(): self.characters.append(CharacterRef(region.currentText(), None, realm.text().strip(), realm.text().strip(), None, name.text().strip())); self._populate()
+        dialog = QDialog(self); dialog.setWindowTitle("Manual character"); form = QFormLayout(dialog); region = QComboBox(); region.addItems(["us", "eu", "kr", "tw"]); region.setCurrentText(self.config.region); game = QComboBox(); game.addItem("Retail", "profile"); game.addItem("Classic progression", "profile-classic"); game.addItem("Classic Era / Hardcore / seasonal", "profile-classic1x"); realm = QLineEdit(); name = QLineEdit(); form.addRow("Region", region); form.addRow("Game version", game); form.addRow("Realm slug", realm); form.addRow("Character name", name); buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel); buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); form.addRow(buttons)
+        if dialog.exec() and realm.text().strip() and name.text().strip(): self.characters.append(CharacterRef(region.currentText(), None, realm.text().strip(), realm.text().strip(), None, name.text().strip(), namespace=str(game.currentData()))); self._populate()
 
     def export_selected(self) -> None:
         row = self.table.currentRow()
         if row < 0: self._error("Select a character first."); return
-        if not self.api or self.api.region != self.characters[row].region: self._error("Connect Battle.net for this character's region first."); return
+        selected = self.table.item(row, 0)
+        character_index = selected.data(Qt.ItemDataRole.UserRole) if selected else None
+        if not isinstance(character_index, int) or not 0 <= character_index < len(self.characters): self._error("The selected character is no longer available. Select it again."); return
+        char = self.characters[character_index]
+        if not self.api or self.api.region != char.region: self._error("Connect Battle.net for this character's region first."); return
         archive_path = self.archive_edit.text().strip()
         if not archive_path: self._error("Choose an archive folder first."); return
-        self.save_config(); char = self.characters[row]; export_assets = self.assets.isChecked(); self.message.setText("Exporting…")
+        self.save_config(); export_assets = self.assets.isChecked(); self.message.setText("Exporting…")
         products = detect_products(self.wow_edit.text()); product = products[0] if products else None
         def work():
             archive = None
