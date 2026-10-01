@@ -13,8 +13,6 @@ def config_path() -> Path:
 
 @dataclass(slots=True)
 class Config:
-    wow_path: str = ""
-    wow_export_path: str = ""
     archive_path: str = ""
     region: str = "us"
     locale: str = "en_US"

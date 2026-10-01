@@ -8,6 +8,32 @@ from wow_timecapsule.verify import verify
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_new_archive_has_character_information_tables_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            archive = Archive(folder)
+            tables = {
+                row[0] for row in archive.db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            self.assertNotIn("asset", tables)
+            self.assertNotIn("character_asset", tables)
+            self.assertNotIn("map", tables)
+            self.assertNotIn("map_export", tables)
+            self.assertNotIn("map_asset", tables)
+            self.assertNotIn("source_file", tables)
+            run_columns = {
+                row[1] for row in archive.db.execute("PRAGMA table_info(archive_run)")
+            }
+            self.assertEqual(
+                run_columns,
+                {
+                    "archive_run_id", "started_at", "completed_at", "app_version",
+                    "region", "locale", "status", "notes",
+                },
+            )
+            archive.close()
+
     def test_snapshot_is_preserved_and_verifies(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -38,6 +64,26 @@ class ArchiveTests(unittest.TestCase):
                     archive.save_raw(run_id, "character_profile", "/profile", data["character_profile"], 200)
                     archive.import_capture(run_id, character, data)
             self.assertEqual(archive.db.execute("SELECT count(*) FROM character_snapshot").fetchone()[0], 2)
+            archive.close()
+
+    def test_duplicate_api_records_are_deduplicated_within_snapshot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            archive = Archive(folder)
+            character = CharacterRef("us", 1, "realm-one", "Realm One", 42, "SameName")
+            duplicate_quest = {"id": 1234, "name": "A Quest Blizzard Listed Twice"}
+            captured = {
+                "character_profile": {"level": 80},
+                "quests": {"quests": [duplicate_quest, duplicate_quest]},
+            }
+            with archive.run(region="us", locale="en_US") as run_id:
+                archive.save_raw(run_id, "character_profile", "/profile", captured["character_profile"], 200)
+                snapshot_id = archive.import_capture(run_id, character, captured)
+
+            count = archive.db.execute(
+                "SELECT count(*) FROM character_quest WHERE character_snapshot_id=?",
+                (snapshot_id,),
+            ).fetchone()[0]
+            self.assertEqual(count, 1)
             archive.close()
 
 
