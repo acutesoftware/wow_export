@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import shutil
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -40,6 +39,7 @@ class Archive:
         schema = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
         self.db.executescript(schema)
         self._migrate_achievement_reference_columns()
+        self._migrate_quest_reference_columns()
         self._migrate_legacy_collections()
         self._backfill_profession_tiers()
         screenshot_columns = {
@@ -47,6 +47,27 @@ class Archive:
         }
         if "sha256" not in screenshot_columns:
             self.db.execute("ALTER TABLE screenshot ADD COLUMN sha256 TEXT")
+        if "captured_at" not in screenshot_columns:
+            self.db.execute("ALTER TABLE screenshot ADD COLUMN captured_at TEXT")
+        if "source_path" not in screenshot_columns:
+            self.db.execute("ALTER TABLE screenshot ADD COLUMN source_path TEXT")
+        self._migrate_screenshots_to_global()
+        screenshot_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(screenshot)")
+        }
+        screenshot_additions = {
+            "screenshot_root_id": "INTEGER REFERENCES screenshot_root",
+            "size_bytes": "INTEGER",
+            "modified_ns": "INTEGER",
+            "is_available": "INTEGER NOT NULL DEFAULT 1",
+        }
+        for name, column_type in screenshot_additions.items():
+            if name not in screenshot_columns:
+                self.db.execute(f"ALTER TABLE screenshot ADD COLUMN {name} {column_type}")
+        self.db.execute("DROP INDEX IF EXISTS screenshot_source_path_unique")
+        self.db.execute(
+            "CREATE UNIQUE INDEX screenshot_source_path_unique ON screenshot(source_path)"
+        )
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.commit()
 
@@ -62,6 +83,39 @@ class Archive:
         for name, column_type in additions.items():
             if name not in columns:
                 self.db.execute(f"ALTER TABLE achievement ADD COLUMN {name} {column_type}")
+
+    def _migrate_quest_reference_columns(self) -> None:
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(quest)")}
+        for name in ("description", "requirements", "category", "reference_json"):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE quest ADD COLUMN {name} TEXT")
+
+    def _migrate_screenshots_to_global(self) -> None:
+        columns = {
+            row[1]: row for row in self.db.execute("PRAGMA table_info(screenshot)")
+        }
+        if not columns or "character_id" not in columns:
+            return
+        self.db.executescript("""
+            CREATE TABLE screenshot_global (
+                screenshot_id INTEGER PRIMARY KEY,
+                relative_path TEXT NOT NULL UNIQUE,
+                caption TEXT,
+                added_at TEXT NOT NULL,
+                captured_at TEXT,
+                source_path TEXT,
+                sha256 TEXT
+            );
+            INSERT INTO screenshot_global(
+                screenshot_id,relative_path,caption,added_at,
+                captured_at,source_path,sha256
+            )
+            SELECT screenshot_id,relative_path,caption,added_at,
+                   captured_at,source_path,sha256
+            FROM screenshot;
+            DROP TABLE screenshot;
+            ALTER TABLE screenshot_global RENAME TO screenshot;
+        """)
 
     def _backfill_profession_tiers(self) -> None:
         """Re-import preserved profession JSON from archives made before tier support."""
@@ -282,25 +336,36 @@ class Archive:
         if not isinstance(criteria, dict) or not criteria:
             return None
         lines: list[str] = []
-        description = criteria.get("description")
-        amount = criteria.get("amount")
-        if description:
-            lines.append(str(description))
-        elif amount:
-            lines.append(f"Complete {amount} required objective(s)")
-        for child in criteria.get("child_criteria", []):
-            if not isinstance(child, dict):
-                continue
-            child_text = child.get("description") or child.get("name")
-            child_amount = child.get("amount")
-            if child_text:
-                lines.append(f"{child_text}{f' ({child_amount})' if child_amount else ''}")
+
+        def walk(node: Any) -> None:
+            if not isinstance(node, dict):
+                return
+            description = node.get("description") or node.get("name")
+            amount = node.get("amount")
+            if description:
+                text = str(description)
+                if amount not in (None, 0, 1):
+                    text += f" ({amount})"
+                lines.append(text)
+            elif amount not in (None, 0):
+                lines.append(f"Complete {amount} required objective(s)")
+            for child in node.get("child_criteria", []):
+                walk(child)
+
+        walk(criteria)
         return "\n".join(dict.fromkeys(lines)) or None
 
     def achievement_reference_ids(self) -> set[int]:
         return {
             int(row[0]) for row in self.db.execute(
                 "SELECT achievement_id FROM achievement WHERE reference_json IS NOT NULL"
+            )
+        }
+
+    def quest_reference_ids(self) -> set[int]:
+        return {
+            int(row[0]) for row in self.db.execute(
+                "SELECT quest_id FROM quest WHERE reference_json IS NOT NULL"
             )
         }
 
@@ -379,26 +444,173 @@ class Archive:
         )
         self.db.commit()
 
-    def add_screenshot(self, character_id: int, source: str | Path, caption: str = "") -> Path:
+    def add_screenshot(
+        self, source: str | Path, caption: str = "",
+        captured_at: str | None = None,
+    ) -> Path:
         source = Path(source).resolve()
         if not source.is_file():
             raise FileNotFoundError(source)
-        folder = self.root / "media" / "screenshots"
-        folder.mkdir(parents=True, exist_ok=True)
-        base = safe_name(source.stem) + source.suffix.lower()
-        destination = folder / base
-        counter = 2
-        while destination.exists():
-            destination = folder / f"{safe_name(source.stem)}_{counter}{source.suffix.lower()}"
-            counter += 1
-        shutil.copy2(source, destination)
-        relative = destination.relative_to(self.root).as_posix()
+        captured_at = captured_at or self._screenshot_date(source)
+        stat = source.stat()
+        absolute = str(source)
         self.db.execute(
-            "INSERT INTO screenshot(character_id,relative_path,caption,added_at,sha256) VALUES(?,?,?,?,?)",
-            (character_id, relative, caption.strip(), now(), sha256(destination)),
+            """INSERT INTO screenshot(
+                   screenshot_root_id,relative_path,caption,added_at,captured_at,
+                   source_path,size_bytes,modified_ns,is_available,sha256
+               ) VALUES(NULL,?,?,?,?,?,?,?,?,NULL)
+               ON CONFLICT(source_path) DO UPDATE SET
+                   caption=COALESCE(NULLIF(excluded.caption,''),screenshot.caption),
+                   captured_at=excluded.captured_at,size_bytes=excluded.size_bytes,
+                   modified_ns=excluded.modified_ns,is_available=1""",
+            (absolute, caption.strip(), now(), captured_at, absolute,
+             stat.st_size, stat.st_mtime_ns, 1),
         )
         self.db.commit()
-        return destination
+        return source
+
+    def import_screenshot_folder(
+        self, root: str | Path,
+        progress: Any = None,
+    ) -> dict[str, int]:
+        root = Path(root).resolve()
+        if not root.is_dir():
+            raise NotADirectoryError(root)
+        root_id = self.db.execute(
+            "INSERT INTO screenshot_root(root_path,added_at) VALUES(?,?) "
+            "ON CONFLICT(root_path) DO UPDATE SET root_path=excluded.root_path "
+            "RETURNING screenshot_root_id",
+            (str(root), now()),
+        ).fetchone()[0]
+        return self._scan_screenshot_root(int(root_id), root, progress)
+
+    def rescan_screenshot_folders(self, progress: Any = None) -> dict[str, int]:
+        totals = {
+            "roots": 0, "scanned": 0, "imported": 0, "updated": 0,
+            "unchanged": 0, "missing": 0, "errors": 0,
+        }
+        for root_id, root_path in self.db.execute(
+            "SELECT screenshot_root_id,root_path FROM screenshot_root ORDER BY root_path"
+        ).fetchall():
+            totals["roots"] += 1
+            try:
+                result = self._scan_screenshot_root(
+                    int(root_id), Path(root_path), None
+                )
+                for key in totals.keys() - {"roots"}:
+                    totals[key] += result.get(key, 0)
+            except (OSError, sqlite3.Error):
+                totals["errors"] += 1
+                totals["missing"] += self.db.execute(
+                    "SELECT COUNT(*) FROM screenshot "
+                    "WHERE screenshot_root_id=? AND is_available=0",
+                    (root_id,),
+                ).fetchone()[0]
+            if progress:
+                progress(dict(totals))
+        return totals
+
+    def _scan_screenshot_root(
+        self, root_id: int, root: Path, progress: Any = None,
+    ) -> dict[str, int]:
+        if not root.is_dir():
+            self.db.execute(
+                "UPDATE screenshot SET is_available=0 WHERE screenshot_root_id=?",
+                (root_id,),
+            )
+            self.db.commit()
+            raise NotADirectoryError(root)
+        extensions = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+        result = {
+            "roots": 1, "scanned": 0, "imported": 0, "updated": 0,
+            "unchanged": 0, "missing": 0, "errors": 0,
+        }
+        self.db.execute(
+            "UPDATE screenshot SET is_available=0 WHERE screenshot_root_id=?", (root_id,)
+        )
+        for source in root.rglob("*"):
+            if not source.is_file() or source.suffix.lower() not in extensions:
+                continue
+            result["scanned"] += 1
+            try:
+                relative_source = source.relative_to(root).as_posix()
+                absolute = str(source.resolve())
+                stat = source.stat()
+                existing = self.db.execute(
+                    "SELECT size_bytes,modified_ns FROM screenshot WHERE source_path=?",
+                    (absolute,),
+                ).fetchone()
+                captured_at = self._screenshot_date(source, read_exif=False)
+                self.db.execute("""
+                    INSERT INTO screenshot(
+                        screenshot_root_id,relative_path,caption,added_at,captured_at,
+                        source_path,size_bytes,modified_ns,is_available,sha256
+                    ) VALUES(?,?,?,?,?,?,?,?,1,NULL)
+                    ON CONFLICT(source_path) DO UPDATE SET
+                        screenshot_root_id=excluded.screenshot_root_id,
+                        relative_path=excluded.relative_path,
+                        captured_at=excluded.captured_at,
+                        size_bytes=excluded.size_bytes,
+                        modified_ns=excluded.modified_ns,is_available=1
+                """, (
+                    root_id, absolute, relative_source, now(), captured_at,
+                    absolute, stat.st_size, stat.st_mtime_ns,
+                ))
+                if existing is None:
+                    result["imported"] += 1
+                elif existing != (stat.st_size, stat.st_mtime_ns):
+                    result["updated"] += 1
+                else:
+                    result["unchanged"] += 1
+            except (OSError, ValueError, sqlite3.Error):
+                result["errors"] += 1
+            if progress and result["scanned"] % 25 == 0:
+                progress(dict(result))
+            if result["scanned"] % 100 == 0:
+                self.db.commit()
+        self.db.commit()
+        result["missing"] = self.db.execute(
+            "SELECT COUNT(*) FROM screenshot WHERE screenshot_root_id=? AND is_available=0",
+            (root_id,),
+        ).fetchone()[0]
+        self.db.execute(
+            "UPDATE screenshot_root SET last_scanned_at=? WHERE screenshot_root_id=?",
+            (now(), root_id),
+        )
+        self.db.commit()
+        if progress:
+            progress(dict(result))
+        return result
+
+    @staticmethod
+    def _screenshot_date(source: Path, read_exif: bool = True) -> str:
+        match = re.search(
+            r"(?:WoWScrnShot[_-])?(\d{2})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})",
+            source.stem, re.IGNORECASE,
+        )
+        if match:
+            try:
+                parsed = datetime.strptime("".join(match.groups()), "%m%d%y%H%M%S")
+                return parsed.astimezone().isoformat(timespec="seconds")
+            except ValueError:
+                pass
+        try:
+            if not read_exif:
+                raise ImportError
+            from PIL import Image
+
+            with Image.open(source) as image:
+                exif = image.getexif()
+                for tag in (36867, 36868, 306):
+                    value = exif.get(tag)
+                    if value:
+                        parsed = datetime.strptime(str(value), "%Y:%m:%d %H:%M:%S")
+                        return parsed.astimezone().isoformat(timespec="seconds")
+        except (ImportError, OSError, ValueError):
+            pass
+        return datetime.fromtimestamp(source.stat().st_mtime).astimezone().isoformat(
+            timespec="seconds"
+        )
 
     def _import_simple(self, sid: int, data: dict, kind: str, observed: str) -> None:
         keys = ("reputations",)
@@ -452,6 +664,22 @@ class Archive:
                          tier_item.get("max_skill_points"), len(recipes), observed,
                          json.dumps(tier_item, ensure_ascii=False)),
                     )
+                    for recipe in recipes:
+                        recipe_id = recipe.get("id")
+                        if recipe_id is None:
+                            continue
+                        self.db.execute(
+                            "INSERT INTO recipe(recipe_id,name,reference_json) VALUES(?,?,?) "
+                            "ON CONFLICT(recipe_id) DO UPDATE SET "
+                            "name=COALESCE(excluded.name,recipe.name),"
+                            "reference_json=COALESCE(excluded.reference_json,recipe.reference_json)",
+                            (recipe_id, recipe.get("name"),
+                             json.dumps(recipe, ensure_ascii=False)),
+                        )
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO character_known_recipe VALUES(?,?,?,?)",
+                            (sid, tier_id, recipe_id, observed),
+                        )
 
     def _import_stats(self, sid: int, data: dict, observed: str) -> None:
         for name, value in data.items():
@@ -459,10 +687,31 @@ class Archive:
                 self.db.execute("INSERT INTO character_stat VALUES(?,?,?,?)", (sid, name, value, observed))
 
     def _import_quests(self, sid: int, data: dict, observed: str) -> None:
+        references = data.get("_reference_details", {})
         for item in data.get("quests", []):
             qid = item.get("id");
             if qid is None: continue
-            self.db.execute("INSERT OR IGNORE INTO quest VALUES(?,?)", (qid, item.get("name")))
+            reference = references.get(str(qid), references.get(qid, {}))
+            requirements = reference.get("requirements")
+            category = reference.get("category", {})
+            category_name = category.get("name") if isinstance(category, dict) else category
+            self.db.execute("""
+                INSERT INTO quest(
+                    quest_id,name,description,requirements,category,reference_json
+                ) VALUES(?,?,?,?,?,?)
+                ON CONFLICT(quest_id) DO UPDATE SET
+                    name=COALESCE(excluded.name,quest.name),
+                    description=COALESCE(excluded.description,quest.description),
+                    requirements=COALESCE(excluded.requirements,quest.requirements),
+                    category=COALESCE(excluded.category,quest.category),
+                    reference_json=COALESCE(excluded.reference_json,quest.reference_json)
+            """, (
+                qid, reference.get("title") or reference.get("name") or item.get("name"),
+                reference.get("description"),
+                json.dumps(requirements, ensure_ascii=False) if requirements else None,
+                category_name,
+                json.dumps(reference, ensure_ascii=False) if reference else None,
+            ))
             self.db.execute("INSERT OR IGNORE INTO character_quest VALUES(?,?,?,?,?)", (sid, qid, "completed", None, observed))
 
     def write_readme(self) -> None:
@@ -471,5 +720,5 @@ class Archive:
         lines = ["# WoW Time Capsule Archive", "", "This is a local, preservation-oriented archive of character information obtained from Blizzard's APIs. It contains original JSON responses, a standard SQLite index, and a local HTML album.", "", "## Characters", ""]
         lines += [f"- {name} — {realm or 'unknown realm'} ({region.upper()})" for name, realm, region in chars] or ["- None yet"]
         lines += ["", "## Latest export", "", f"- Exported: {run[0] if run else 'unknown'}", "- Exporter version: " + __version__]
-        lines += ["", "## Opening and formats", "", "Open `index.html` in a browser to view the album. Open `wow_archive.sqlite` with any SQLite 3 browser. Original Blizzard API responses are under `raw/api/` as UTF-8 JSON. Screenshots are under `media/screenshots/`. Run `python -m wow_timecapsule.verify .` from this directory to verify database integrity and saved-file checksums.", "", "## Limitations", "", "This archive records what Blizzard's supported APIs exposed at each observation time. It is not a complete historical activity log and contains no game assets or 3D models.", ""]
+        lines += ["", "## Opening and formats", "", "Open `index.html` in a browser to view the album. Open `wow_archive.sqlite` with any SQLite 3 browser. Original Blizzard API responses are under `raw/api/` as UTF-8 JSON. Screenshot folders are external links registered in SQLite and can be refreshed with Rescan Screenshot Folders. Run `python -m wow_timecapsule.verify .` from this directory to verify database integrity, saved API files, and screenshot link availability.", "", "## Limitations", "", "This archive records what Blizzard's supported APIs exposed at each observation time. It is not a complete historical activity log and contains no game assets or 3D models. Screenshot images are not copied into this archive.", ""]
         (self.root / "README.md").write_text("\n".join(lines), encoding="utf-8")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -27,6 +28,12 @@ class CharacterRef:
     playable_class: str = ""
     namespace: str = "profile"
     playable_class_id: int | None = None
+    protected_path: str = ""
+    playable_race: str = ""
+    playable_race_id: int | None = None
+    faction: str = ""
+    gender: str = ""
+    protected_namespace: str = "profile"
 
     @property
     def game_version(self) -> str:
@@ -70,11 +77,27 @@ class BlizzardAPI:
             for account in data.get("wow_accounts", []):
                 for char in account.get("characters", []):
                     realm = char.get("realm", {})
+                    protected_href = char.get("protected_character", {}).get("href", "")
+                    protected_url = urlparse(protected_href) if protected_href else None
+                    protected_path = protected_url.path if protected_url else ""
+                    protected_qualified = (
+                        parse_qs(protected_url.query).get("namespace", ["profile"])[0]
+                        if protected_url else "profile"
+                    )
+                    protected_namespace = protected_qualified.removesuffix(
+                        f"-{self.region}"
+                    )
                     characters.append(CharacterRef(
                         self.region, realm.get("id"), realm.get("slug", ""), realm.get("name", ""),
                         char.get("id"), char.get("name", ""), char.get("level"),
                         char.get("playable_class", {}).get("name", ""), namespace,
                         char.get("playable_class", {}).get("id"),
+                        protected_path,
+                        char.get("playable_race", {}).get("name", ""),
+                        char.get("playable_race", {}).get("id"),
+                        char.get("faction", {}).get("name", ""),
+                        char.get("gender", {}).get("name", ""),
+                        protected_namespace,
                     ))
         raw: dict[str, Any] = {"namespaces": sources}
         if failures:
@@ -85,6 +108,8 @@ class BlizzardAPI:
         self, character: CharacterRef,
         save: Callable[[str, str, dict, int], None],
         known_achievement_ids: set[int] | None = None,
+        progress: Callable[[str], None] | None = None,
+        known_quest_ids: set[int] | None = None,
     ) -> dict[str, dict]:
         base = f"/profile/wow/character/{character.realm_slug.lower()}/{character.name.lower()}"
         endpoints = {
@@ -113,6 +138,8 @@ class BlizzardAPI:
                     "detail": "Not applicable: this character is not a Hunter.",
                 }
                 continue
+            if progress:
+                progress(name.replace("_", " ").title())
             try:
                 data, status = self.get(endpoint, namespace)
                 save(name, endpoint, data, status)
@@ -124,6 +151,56 @@ class BlizzardAPI:
                 }
             except httpx.HTTPError as exc:
                 failures[name] = str(exc)
+                if name == "character_profile":
+                    if not character.protected_path:
+                        outcomes[name] = {
+                            "status": "request_failed", "count": None, "detail": str(exc),
+                        }
+                        break
+                    public_error = str(exc)
+                    if progress:
+                        progress("Authenticated profile fallback")
+                    try:
+                        protected, status = self.get(
+                            character.protected_path, character.protected_namespace
+                        )
+                        profile = self._normalise_protected_profile(protected, character)
+                        save("character_profile", character.protected_path, protected, status)
+                        captured[name] = profile
+                        outcomes[name] = {
+                            "status": "captured",
+                            "count": 1,
+                            "detail": (
+                                "The public profile returned 404; captured through Blizzard's "
+                                "authenticated protected-character record."
+                            ),
+                        }
+                        failures["public_character_profile"] = public_error
+                    except httpx.HTTPError as protected_exc:
+                        protected_error = str(protected_exc)
+                        captured[name] = self._basic_account_profile(character)
+                        outcomes[name] = {
+                            "status": "captured",
+                            "count": 1,
+                            "detail": (
+                                "Basic identity captured from the authenticated account list; "
+                                "Blizzard did not return the detailed character profile."
+                            ),
+                        }
+                        outcomes["profile_details"] = {
+                            "status": "request_failed",
+                            "count": None,
+                            "detail": (
+                                "Public profile failed: " + public_error +
+                                " Protected profile failed: " + protected_error +
+                                " Check Game Data and Profile Privacy at "
+                                "https://account.blizzard.com/privacy, then log into and out of "
+                                "the character before reconnecting."
+                            ),
+                        }
+                        failures["public_character_profile"] = public_error
+                        failures["protected_character_profile"] = protected_error
+                    continue
                 outcomes[name] = {
                     "status": "request_failed",
                     "count": None,
@@ -141,17 +218,124 @@ class BlizzardAPI:
         if "achievements" in captured:
             reference_outcome = self._capture_achievement_references(
                 captured["achievements"], character.namespace, save,
-                known_achievement_ids or set(),
+                known_achievement_ids or set(), progress,
             )
             outcomes["achievement_details"] = reference_outcome
+        if "quests" in captured:
+            outcomes["quest_details"] = self._capture_quest_references(
+                captured["quests"], character.namespace, save,
+                known_quest_ids or set(), progress,
+            )
         if failures:
             captured["_failures"] = failures
         captured["_outcomes"] = outcomes
         return captured
 
+    def _capture_quest_references(
+        self, quests: dict[str, Any], profile_namespace: str,
+        save: Callable[[str, str, dict, int], None], known_ids: set[int],
+        progress: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        quest_ids = {
+            int(item["id"]) for item in quests.get("quests", [])
+            if item.get("id") is not None
+        }
+        cache: dict[int, dict[str, Any]] = getattr(self, "_quest_cache", {})
+        self._quest_cache = cache
+        details: dict[str, dict[str, Any]] = {}
+        failed: list[str] = []
+        static_namespace = profile_namespace.replace("profile", "static", 1)
+        pending_ids = sorted(quest_ids - known_ids)
+        rate_limited = False
+        for index, quest_id in enumerate(pending_ids, 1):
+            if progress and (index == 1 or index % 25 == 0 or index == len(pending_ids)):
+                progress(f"Quest reference details {index}/{len(pending_ids)}")
+            if quest_id in cache:
+                details[str(quest_id)] = cache[quest_id]
+                continue
+            endpoint = f"/data/wow/quest/{quest_id}"
+            try:
+                reference, _status = self.get(endpoint, static_namespace)
+                cache[quest_id] = reference
+                details[str(quest_id)] = reference
+            except httpx.HTTPStatusError as exc:
+                failed.append(f"{quest_id}: {exc}")
+                if exc.response.status_code == 429:
+                    rate_limited = True
+                    break
+            except httpx.HTTPError as exc:
+                failed.append(f"{quest_id}: {exc}")
+        if details:
+            save(
+                "quest_details", "/data/wow/quest/{id}",
+                {"quests": details}, 200,
+            )
+            quests["_reference_details"] = details
+        reused = len(quest_ids & known_ids)
+        detail_parts = []
+        if reused:
+            detail_parts.append(f"Reused {reused} reference records already in the archive.")
+        if failed:
+            detail_parts.append(
+                f"{len(failed)} reference request(s) failed: " + "; ".join(failed[:3])
+            )
+        if rate_limited:
+            detail_parts.append(
+                "Blizzard rate-limited the requests; export again later to resume the missing records."
+            )
+        captured_count = len(details) + reused
+        status = "request_failed" if quest_ids and captured_count == 0 else "captured"
+        return {
+            "status": status,
+            "count": captured_count,
+            "detail": " ".join(detail_parts),
+        }
+
+    @staticmethod
+    def _normalise_protected_profile(
+        data: dict[str, Any], character: CharacterRef
+    ) -> dict[str, Any]:
+        """Make either protected-profile response shape importable as a profile."""
+        nested = data.get("character")
+        profile = dict(data)
+        if isinstance(nested, dict) and nested.get("name"):
+            profile.update(nested)
+        fallback = BlizzardAPI._basic_account_profile(character)
+        for key, value in fallback.items():
+            if not profile.get(key):
+                profile[key] = value
+        return profile
+
+    @staticmethod
+    def _basic_account_profile(character: CharacterRef) -> dict[str, Any]:
+        profile: dict[str, Any] = {
+            "id": character.character_id,
+            "name": character.name,
+            "level": character.level,
+            "realm": {
+                "id": character.realm_id,
+                "slug": character.realm_slug,
+                "name": character.realm_name,
+            },
+            "character_class": {
+                "id": character.playable_class_id,
+                "name": character.playable_class,
+            },
+        }
+        if character.playable_race or character.playable_race_id is not None:
+            profile["race"] = {
+                "id": character.playable_race_id, "name": character.playable_race,
+            }
+        if character.faction:
+            profile["faction"] = {"name": character.faction}
+        if character.gender:
+            profile["gender"] = {"name": character.gender}
+        return profile
+
     def _capture_achievement_references(
         self, achievements: dict[str, Any], profile_namespace: str,
         save: Callable[[str, str, dict, int], None], known_ids: set[int],
+        progress: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         completed_ids: set[int] = set()
         for item in achievements.get("achievements", []):
@@ -169,7 +353,10 @@ class BlizzardAPI:
         details: dict[str, dict[str, Any]] = {}
         failed: list[str] = []
         static_namespace = profile_namespace.replace("profile", "static", 1)
-        for achievement_id in sorted(completed_ids - known_ids):
+        pending_ids = sorted(completed_ids - known_ids)
+        for index, achievement_id in enumerate(pending_ids, 1):
+            if progress and (index == 1 or index % 10 == 0 or index == len(pending_ids)):
+                progress(f"Achievement reference details {index}/{len(pending_ids)}")
             if achievement_id in cache:
                 details[str(achievement_id)] = cache[achievement_id]
                 continue

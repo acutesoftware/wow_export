@@ -3,11 +3,12 @@ from __future__ import annotations
 import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -43,9 +44,26 @@ class Events(QObject):
     connected = Signal(object)
     exported = Signal(object)
     failure = Signal(str)
+    progress = Signal(str)
+    screenshot_progress = Signal(object)
+    screenshots_imported = Signal(object)
 
 
 SORT_VALUE_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+
+
+class AlbumPage(QWebEnginePage):
+    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+    def acceptNavigationRequest(self, url: QUrl, navigation_type, is_main_frame: bool) -> bool:  # noqa: N802
+        if (
+            navigation_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked
+            and url.isLocalFile()
+            and Path(url.toLocalFile()).suffix.lower() in self.IMAGE_EXTENSIONS
+        ):
+            QDesktopServices.openUrl(url)
+            return False
+        return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
 
 
 class SortableTableWidgetItem(QTableWidgetItem):
@@ -103,6 +121,11 @@ class MainWindow(QMainWindow):
         self.events.connected.connect(self._connected)
         self.events.exported.connect(self._exported)
         self.events.failure.connect(self._error)
+        self.events.progress.connect(self._export_progress)
+        self.events.screenshot_progress.connect(self._screenshot_import_progress)
+        self.events.screenshots_imported.connect(self._screenshots_imported)
+        self._export_busy = False
+        self._screenshot_import_busy = False
 
         root = QWidget()
         layout = QVBoxLayout(root)
@@ -139,22 +162,35 @@ class MainWindow(QMainWindow):
         layout.addLayout(row)
 
         memory_row = QHBoxLayout()
-        memory_row.addWidget(QLabel("Add to:"))
+        memory_row.addWidget(QLabel("Add note to:"))
         self.view_character_combo = QComboBox()
         self.view_character_combo.currentIndexChanged.connect(
             self._show_selected_character
         )
         memory_row.addWidget(self.view_character_combo, 1)
-        screenshot = QPushButton("Add Screenshot")
-        screenshot.clicked.connect(self.add_screenshot)
-        memory_row.addWidget(screenshot)
         note = QPushButton("Add Note")
         note.clicked.connect(self.add_memory)
         memory_row.addWidget(note)
         memory_row.addStretch()
         layout.addLayout(memory_row)
+        screenshot_row = QHBoxLayout()
+        screenshot_row.addWidget(QLabel("Screenshots (Timeline):"))
+        self.screenshot_button = QPushButton("Add Screenshot")
+        self.screenshot_button.clicked.connect(self.add_screenshot)
+        screenshot_row.addWidget(self.screenshot_button)
+        self.screenshot_folder_button = QPushButton("Add Screenshot Folder")
+        self.screenshot_folder_button.clicked.connect(self.import_screenshot_folder)
+        screenshot_row.addWidget(self.screenshot_folder_button)
+        self.screenshot_rescan_button = QPushButton("Rescan Screenshot Folders")
+        self.screenshot_rescan_button.clicked.connect(self.rescan_screenshot_folders)
+        screenshot_row.addWidget(self.screenshot_rescan_button)
+        screenshot_row.addStretch()
+        layout.addLayout(screenshot_row)
+        self.view_status = QLabel("")
+        layout.addWidget(self.view_status)
 
         self.viewer = QWebEngineView()
+        self.viewer.setPage(AlbumPage(self.viewer))
         self.viewer.settings().setAttribute(
             QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True
         )
@@ -176,6 +212,7 @@ class MainWindow(QMainWindow):
         row.addWidget(refresh)
         layout.addLayout(row)
         self.timeline_viewer = QWebEngineView()
+        self.timeline_viewer.setPage(AlbumPage(self.timeline_viewer))
         self.timeline_viewer.settings().setAttribute(
             QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True
         )
@@ -219,9 +256,9 @@ class MainWindow(QMainWindow):
         manual = QPushButton("Add Manual Character")
         manual.clicked.connect(self.add_manual)
         controls.addWidget(manual)
-        export = QPushButton("Export Selected Characters")
-        export.clicked.connect(self.export_selected)
-        controls.addWidget(export)
+        self.export_button = QPushButton("Export Selected Characters")
+        self.export_button.clicked.connect(self.export_selected)
+        controls.addWidget(self.export_button)
         rebuild = QPushButton("Rebuild HTML from Existing Archive")
         rebuild.clicked.connect(self._rebuild_from_export)
         controls.addWidget(rebuild)
@@ -231,7 +268,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Capture results"))
         self.results = QTableWidget(0, 3)
         self.results.setHorizontalHeaderLabels(["Character", "Section", "Result"])
-        self.results.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.results.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.results.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.results.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch
+        )
+        self.results.cellDoubleClicked.connect(self._show_result_detail)
         layout.addWidget(self.results, 1)
         self.message = QLabel("")
         self.message.setWordWrap(True)
@@ -379,14 +425,20 @@ class MainWindow(QMainWindow):
             self._error("Choose an export destination first.")
             return
         self.save_config()
-        self.message.setText("Exporting character information…")
+        self._set_export_busy(True)
+        self.message.setText("Export started — preparing the selected characters…")
         self.results.setRowCount(0)
 
         def work():
+            started = time.perf_counter()
             summaries: list[dict] = []
-            for char in characters:
+            total = len(characters)
+            for position, char in enumerate(characters, 1):
                 archive = None
                 try:
+                    self.events.progress.emit(
+                        f"Exporting {position}/{total}: {char.name} — starting profile"
+                    )
                     archive = Archive(archive_path)
                     with archive.run(region=char.region, locale=self.config.locale) as run_id:
                         observed = now()
@@ -401,6 +453,10 @@ class MainWindow(QMainWindow):
                                 run_id, name, endpoint, payload, status, observed
                             ),
                             archive.achievement_reference_ids(),
+                            lambda stage, char=char, position=position: self.events.progress.emit(
+                                f"Exporting {position}/{total}: {char.name} — {stage}"
+                            ),
+                            archive.quest_reference_ids(),
                         )
                         snapshot_id = archive.import_capture(run_id, char, captured, observed)
                         sections = archive.capture_summary(snapshot_id)
@@ -417,6 +473,7 @@ class MainWindow(QMainWindow):
                     if archive:
                         archive.close()
             try:
+                self.events.progress.emit("Generating the offline HTML album…")
                 generate_html(archive_path)
             except Exception as exc:
                 summaries.append({
@@ -425,7 +482,11 @@ class MainWindow(QMainWindow):
                         "count": None, "detail": str(exc),
                     }],
                 })
-            self.events.exported.emit({"archive": archive_path, "summaries": summaries})
+            self.events.exported.emit({
+                "archive": archive_path,
+                "summaries": summaries,
+                "elapsed": time.perf_counter() - started,
+            })
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -434,10 +495,19 @@ class MainWindow(QMainWindow):
         count = section.get("count")
         detail = section.get("detail") or ""
         if status == "captured":
+            if "Basic identity captured" in detail:
+                return "Captured basic account data only — double-click for details"
+            if "authenticated protected-character" in detail:
+                return "Captured via authenticated profile — double-click for details"
             return f"Captured — {count} record{'s' if count != 1 else ''}"
         if status == "unavailable":
             return f"Unavailable{f' — {detail}' if detail else ''}"
-        return f"Request failed{f' — {detail}' if detail else ''}"
+        if "Blizzard has no profile" in detail:
+            return "Profile unavailable (404) — double-click for details"
+        summary = detail.split("\n", 1)[0]
+        if len(summary) > 140:
+            summary = summary[:137] + "…"
+        return f"Request failed{f' — {summary}' if summary else ''}"
 
     def _exported(self, result: object) -> None:
         summaries = result["summaries"]
@@ -454,15 +524,24 @@ class MainWindow(QMainWindow):
                 )
                 self.results.setItem(row, 0, QTableWidgetItem(summary["character"]))
                 self.results.setItem(row, 1, QTableWidgetItem(label))
-                self.results.setItem(row, 2, QTableWidgetItem(self._result_text(section)))
+                result_item = QTableWidgetItem(self._result_text(section))
+                result_item.setToolTip(section.get("detail") or result_item.text())
+                self.results.setItem(row, 2, result_item)
                 row += 1
+        elapsed = float(result.get("elapsed", 0))
+        outcome = (
+            f"completed with {failures} failed section{'s' if failures != 1 else ''}"
+            if failures else "completed successfully"
+        )
         self.message.setText(
-            f"Export finished with {failures} failed section{'s' if failures != 1 else ''}. "
-            "The View tab shows the saved archive."
+            f"Export {outcome} in {elapsed:.1f} seconds. "
+            "Double-click any result with details for the full explanation."
         )
         self._set_archive_path(result["archive"])
         self.refresh_view()
-        self.tabs.setCurrentWidget(self.view_tab)
+        if not failures:
+            self.tabs.setCurrentWidget(self.view_tab)
+        self._set_export_busy(False)
 
     def _rebuild_from_export(self) -> None:
         self._set_archive_path(self.export_archive_edit.text().strip())
@@ -527,9 +606,9 @@ class MainWindow(QMainWindow):
             self.viewer.page().runJavaScript(f"showCharacterById({character_id})")
 
     def add_screenshot(self) -> None:
-        character_id = self._view_character_id()
-        if character_id is None:
-            self._error("Open an archive and choose a character first.")
+        archive_path = self.view_archive_edit.text().strip()
+        if not (Path(archive_path) / "wow_archive.sqlite").is_file():
+            self._error("Open an archive before adding screenshot links.")
             return
         source = QFileDialog.getOpenFileName(
             self, "Add screenshot", "", "Images (*.png *.jpg *.jpeg *.webp);;All files (*)"
@@ -539,12 +618,105 @@ class MainWindow(QMainWindow):
         caption, accepted = QInputDialog.getText(self, "Screenshot caption", "Caption:")
         if not accepted:
             return
-        archive = Archive(self.view_archive_edit.text().strip())
+        archive = Archive(archive_path)
         try:
-            archive.add_screenshot(character_id, source, caption)
+            archive.add_screenshot(source, caption)
         finally:
             archive.close()
         self.refresh_view()
+
+    def import_screenshot_folder(self) -> None:
+        archive_path = self.view_archive_edit.text().strip()
+        if not (Path(archive_path) / "wow_archive.sqlite").is_file():
+            self._error("Open an archive before adding a screenshot folder.")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Choose screenshot root folder")
+        if not folder:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Import screenshot folder",
+            f"Recursively import supported images from:\n{folder}\n\n"
+            "Only file links and dates will be stored. Images will not be copied. "
+            "The folder will be registered for later rescans.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._set_screenshot_import_busy(True)
+        self.view_status.setText("Scanning screenshot folders…")
+
+        def work():
+            archive = None
+            try:
+                archive = Archive(archive_path)
+                result = archive.import_screenshot_folder(
+                    folder, self.events.screenshot_progress.emit
+                )
+                result["folder"] = folder
+            except Exception as exc:
+                result = {"error": str(exc), "folder": folder}
+            finally:
+                if archive:
+                    archive.close()
+            self.events.screenshots_imported.emit(result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def rescan_screenshot_folders(self) -> None:
+        archive_path = self.view_archive_edit.text().strip()
+        if not (Path(archive_path) / "wow_archive.sqlite").is_file():
+            self._error("Open an archive before rescanning screenshot folders.")
+            return
+        self._set_screenshot_import_busy(True)
+        self.view_status.setText("Rescanning registered screenshot folders…")
+
+        def work():
+            archive = None
+            try:
+                archive = Archive(archive_path)
+                result = archive.rescan_screenshot_folders(
+                    self.events.screenshot_progress.emit
+                )
+            except Exception as exc:
+                result = {"error": str(exc)}
+            finally:
+                if archive:
+                    archive.close()
+            self.events.screenshots_imported.emit(result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _screenshot_import_progress(self, result: object) -> None:
+        self.view_status.setText(
+            f"Scanning screenshots: {result['scanned']:,} found, "
+            f"{result['imported']:,} new, {result.get('updated', 0):,} updated"
+        )
+
+    def _screenshots_imported(self, result: object) -> None:
+        self._set_screenshot_import_busy(False)
+        if result.get("error"):
+            self.view_status.setText("Screenshot import failed.")
+            QMessageBox.critical(self, "Screenshot import", result["error"])
+            return
+        self.view_status.setText(
+            f"Screenshot scan finished: {result.get('imported', 0):,} new links, "
+            f"{result.get('updated', 0):,} updated, "
+            f"{result.get('unchanged', 0):,} unchanged, "
+            f"{result.get('missing', 0):,} missing, {result.get('errors', 0):,} errors."
+        )
+        self.refresh_view()
+
+    def _set_screenshot_import_busy(self, busy: bool) -> None:
+        if busy == self._screenshot_import_busy:
+            return
+        self._screenshot_import_busy = busy
+        self.screenshot_button.setEnabled(not busy)
+        self.screenshot_folder_button.setEnabled(not busy)
+        self.screenshot_rescan_button.setEnabled(not busy)
+        if busy:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        elif QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
 
     def add_memory(self) -> None:
         character_id = self._view_character_id()
@@ -574,11 +746,36 @@ class MainWindow(QMainWindow):
             self._error("This archive does not have an HTML summary yet.")
 
     def _error(self, message: str) -> None:
+        self._set_export_busy(False)
         self.connect_button.setEnabled(True)
         self.message.setText(message)
         QMessageBox.critical(self, "WoW Time Capsule", message)
 
+    def _export_progress(self, message: str) -> None:
+        self.message.setText(message)
+
+    def _set_export_busy(self, busy: bool) -> None:
+        if busy == self._export_busy:
+            return
+        self._export_busy = busy
+        self.export_button.setEnabled(not busy)
+        self.connect_button.setEnabled(not busy)
+        self.table.setEnabled(not busy)
+        if busy:
+            self.status.setText("Status: Connected — Exporting…")
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        elif QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
+        if not busy and self.api:
+            self.status.setText("Status: Connected")
+
+    def _show_result_detail(self, row: int, _column: int) -> None:
+        item = self.results.item(row, 2)
+        if item and item.toolTip():
+            QMessageBox.information(self, "Capture result details", item.toolTip())
+
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._set_export_busy(False)
         self.save_config()
         if self.api:
             self.api.close()

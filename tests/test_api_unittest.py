@@ -25,7 +25,13 @@ class BlizzardAPITests(unittest.TestCase):
                     "id": 2,
                     "name": f"{suffix}char",
                     "level": 10,
-                    "playable_class": {"name": "Warrior"},
+                    "playable_class": {"id": 1, "name": "Warrior"},
+                    "playable_race": {"id": 2, "name": "Orc"},
+                    "faction": {"name": "Horde"},
+                    "protected_character": {
+                        "href": "https://us.api.blizzard.com/profile/user/wow/"
+                                "protected-character/1-2?namespace=profile-us"
+                    },
                 }]}]
             }, 200
 
@@ -35,6 +41,10 @@ class BlizzardAPITests(unittest.TestCase):
         self.assertEqual(requested, ["profile", "profile-classic", "profile-classic1x"])
         self.assertEqual([char.namespace for char in characters], ["profile", "profile-classic1x"])
         self.assertEqual(characters[1].game_version, "Classic Era / Hardcore / seasonal")
+        self.assertEqual(characters[0].protected_path, "/profile/user/wow/protected-character/1-2")
+        self.assertEqual(characters[1].protected_namespace, "profile")
+        self.assertEqual(characters[0].playable_race, "Orc")
+        self.assertEqual(characters[0].faction, "Horde")
         self.assertIn("profile-classic1x-us", raw["namespaces"])
         self.assertIn("profile-classic-us", raw["_failures"])
         self.assertEqual(status, 200)
@@ -44,6 +54,7 @@ class BlizzardAPITests(unittest.TestCase):
         api.region = "us"
         api.locale = "en_US"
         requested = []
+        progress = []
 
         def fake_get(path, namespace="profile"):
             requested.append(namespace)
@@ -58,9 +69,83 @@ class BlizzardAPITests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(RuntimeError, "profile-classic1x-us"):
-            api.capture_character(character, lambda *_args: None)
-        self.assertTrue(requested)
-        self.assertEqual(set(requested), {"profile-classic1x", "profile"})
+            api.capture_character(
+                character, lambda *_args: None, progress=progress.append
+            )
+        self.assertEqual(requested, ["profile-classic1x"])
+        self.assertEqual(progress, ["Character Profile"])
+
+    def test_public_404_uses_authenticated_protected_profile(self):
+        api = BlizzardAPI.__new__(BlizzardAPI)
+        api.region = "us"
+        api.locale = "en_US"
+        requested = []
+        saved = []
+
+        def fake_get(path, namespace="profile"):
+            requested.append((path, namespace))
+            if path == "/profile/wow/character/garona/silencing":
+                request = httpx.Request("GET", "https://us.api.blizzard.com" + path)
+                response = httpx.Response(404, request=request)
+                raise httpx.HTTPStatusError("404 Not Found", request=request, response=response)
+            if path == "/profile/user/wow/protected-character/63-1234":
+                return {
+                    "character": {
+                        "id": 1234, "name": "Silencing", "level": 41,
+                        "realm": {"id": 63, "name": "Garona", "slug": "garona"},
+                    },
+                    "last_login_timestamp": 1_700_000_000_000,
+                }, 200
+            return {}, 200
+
+        api.get = fake_get
+        character = CharacterRef(
+            "us", 63, "garona", "Garona", 1234, "Silencing", 41,
+            "Warlock", "profile", 9,
+            "/profile/user/wow/protected-character/63-1234", "Human", 1,
+            "Alliance", "Female",
+        )
+        captured = api.capture_character(
+            character, lambda *args: saved.append(args), set()
+        )
+
+        self.assertIn(
+            ("/profile/user/wow/protected-character/63-1234", "profile"), requested
+        )
+        self.assertEqual(captured["character_profile"]["name"], "Silencing")
+        self.assertEqual(captured["character_profile"]["character_class"]["name"], "Warlock")
+        self.assertEqual(captured["character_profile"]["race"]["name"], "Human")
+        self.assertEqual(captured["_outcomes"]["character_profile"]["status"], "captured")
+        self.assertTrue(any(item[0] == "character_profile" for item in saved))
+
+    def test_protected_failure_preserves_basic_account_identity(self):
+        api = BlizzardAPI.__new__(BlizzardAPI)
+        api.region = "us"
+        api.locale = "en_US"
+
+        def fake_get(path, namespace="profile"):
+            if path in {
+                "/profile/wow/character/garona/oldname",
+                "/profile/user/wow/protected-character/63-99",
+            }:
+                request = httpx.Request("GET", "https://us.api.blizzard.com" + path)
+                response = httpx.Response(404, request=request)
+                raise httpx.HTTPStatusError("404 Not Found", request=request, response=response)
+            return {}, 200
+
+        api.get = fake_get
+        character = CharacterRef(
+            "us", 63, "garona", "Garona", 99, "Oldname", 25,
+            "Mage", "profile", 8,
+            "/profile/user/wow/protected-character/63-99", "Human", 1,
+            "Alliance",
+        )
+        captured = api.capture_character(character, lambda *_args: None)
+
+        self.assertEqual(captured["character_profile"]["level"], 25)
+        self.assertEqual(captured["character_profile"]["character_class"]["name"], "Mage")
+        self.assertEqual(captured["_outcomes"]["character_profile"]["status"], "captured")
+        self.assertEqual(captured["_outcomes"]["profile_details"]["status"], "request_failed")
 
     def test_account_collections_use_retail_namespace_for_classic_character(self):
         api = BlizzardAPI.__new__(BlizzardAPI)
@@ -154,6 +239,39 @@ class BlizzardAPITests(unittest.TestCase):
         )
         self.assertEqual(captured["_outcomes"]["achievement_details"]["count"], 1)
         self.assertTrue(any(item[0] == "achievement_details" for item in saved))
+
+    def test_completed_quest_reference_descriptions_are_downloaded(self):
+        api = BlizzardAPI.__new__(BlizzardAPI)
+        api.region = "us"
+        api.locale = "en_US"
+        requested = []
+        saved = []
+
+        def fake_get(path, namespace="profile"):
+            requested.append((path, namespace))
+            if path.endswith("/quests/completed"):
+                return {"quests": [{"id": 60, "name": "Kobold Candles"}]}, 200
+            if path == "/data/wow/quest/60":
+                return {
+                    "id": 60, "title": "Kobold Candles",
+                    "description": "Bring candles back to the quest giver.",
+                    "category": {"name": "Elwynn Forest"},
+                }, 200
+            return {}, 200
+
+        api.get = fake_get
+        character = CharacterRef("us", 1, "realm", "Realm", 42, "Example")
+        captured = api.capture_character(
+            character, lambda *args: saved.append(args), set(), None, set()
+        )
+
+        self.assertIn(("/data/wow/quest/60", "static"), requested)
+        self.assertEqual(
+            captured["quests"]["_reference_details"]["60"]["description"],
+            "Bring candles back to the quest giver.",
+        )
+        self.assertEqual(captured["_outcomes"]["quest_details"]["count"], 1)
+        self.assertTrue(any(item[0] == "quest_details" for item in saved))
 
 
 if __name__ == "__main__":

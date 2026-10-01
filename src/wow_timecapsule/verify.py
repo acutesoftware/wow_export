@@ -33,14 +33,20 @@ def verify(root: str | Path) -> tuple[bool, list[str]]:
         records = list(db.execute("SELECT relative_path,sha256 FROM raw_api_file"))
         counts["Raw API files"] = len(records)
         screenshot_columns = {row[1] for row in db.execute("PRAGMA table_info(screenshot)")}
-        if "sha256" in screenshot_columns:
-            screenshots = list(db.execute("SELECT relative_path,sha256 FROM screenshot"))
-        elif screenshot_columns:
-            screenshots = list(db.execute("SELECT relative_path,NULL FROM screenshot"))
-        else:
-            screenshots = []
+        screenshots = list(db.execute(
+            "SELECT relative_path,source_path,COALESCE(is_available,1),sha256 "
+            "FROM screenshot"
+        )) if {"source_path", "is_available", "sha256"} <= screenshot_columns else []
         counts["Screenshots"] = len(screenshots)
-        records.extend(screenshots)
+        external_links = 0
+        for relative, source, available, expected in screenshots:
+            source_path = Path(source or "")
+            if source_path.is_absolute():
+                external_links += 1
+                if available and not source_path.is_file():
+                    errors.append(f"Missing screenshot link: {source_path}")
+            else:
+                records.append((relative, expected))
         for relative, expected in records:
             if Path(relative).is_absolute() or ".." in Path(relative).parts:
                 errors.append(f"Unsafe stored path: {relative}"); continue
@@ -54,11 +60,14 @@ def verify(root: str | Path) -> tuple[bool, list[str]]:
         errors.append(f"Database error: {exc}")
     lines = ["Archive verification", "", f"Database ........ {'OK' if not any('Database' in e for e in errors) else 'FAILED'}"]
     lines.extend(f"{name + ' ':<18} {count:,}" for name, count in counts.items())
-    lines += [f"Checksums ........ {'OK' if not errors else 'FAILED'}", "External deps .... NONE"]
+    lines += [
+        f"Checksums ........ {'OK' if not errors else 'FAILED'}",
+        f"Screenshot links . {external_links:,}",
+    ]
     if errors:
         lines += ["", *[f"ERROR: {error}" for error in errors], "", "Archive verification failed."]
     else:
-        lines += ["", "Archive is self-contained."]
+        lines += ["", "Archive core files are valid. Screenshot links are external by design."]
     return not errors, lines
 
 

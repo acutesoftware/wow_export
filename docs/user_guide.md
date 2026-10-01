@@ -93,6 +93,13 @@ are saved as plain text in
 3. Click **Export Selected Characters**.
 4. Review **Capture results**, then open the **View** tab.
 
+During export, the mouse cursor changes to an hourglass, the character table and
+connection/export buttons are disabled, and the message below Capture results
+shows the current character and section. The first achievement-enriched export
+may show `Achievement reference details 120/428` while it downloads records.
+When processing ends, the message explicitly says whether export completed and
+how long it took.
+
 The archive contains the original API JSON, SQLite records, run information,
 an archive-specific README, and a local `index.html` album. Depending on what
 Blizzard exposes, a snapshot can include profile, appearance, equipment,
@@ -116,6 +123,10 @@ The result table deliberately distinguishes these cases:
 | **Captured - 0 records** | The request succeeded, but its list was empty. |
 | **Unavailable** | The section does not apply or is not exposed for this character/game version. |
 | **Request failed - details** | The app tried the request, but Blizzard rejected it or a connection error occurred. |
+
+Hover over a result to see its error, or double-click a failed result to open the
+complete explanation. When any section fails, the app stays on Export rather
+than moving to View automatically.
 
 An optional section failing does not discard the character data that was
 successfully captured. Its exact outcome remains visible under **Archive
@@ -167,8 +178,32 @@ The album uses the latest successful saved snapshot for each character and
 shows its capture date. It does not create comparisons, reminders, or daily
 tracking.
 
-Use **Add Screenshot** or **Add Note** after selecting a character. Screenshots
-are copied into the archive, so moving the whole archive does not break them.
+Use **Add Note** for a selected character. Screenshots are deliberately
+character-independent: they record what was happening in World of Warcraft,
+not what a particular character did. They appear only as dated Timeline
+events.
+
+Click **Add Screenshot Folder** to register a folder and scan all its
+subfolders. The app stores links, dates, file sizes and modified times in
+SQLite. It does **not** copy or hash the image contents. No character selection
+or association is used. **Add Screenshot** registers one
+character-independent file in the same way.
+
+Click **Rescan Screenshot Folders** after adding files to the NAS. A rescan
+discovers new paths, refreshes changed metadata and marks missing links without
+deleting their historical database rows. The original registered folders must
+remain accessible at the same paths for images to display.
+
+For a folder scan, screenshot dates come from the standard
+`WoWScrnShot_MMDDYY_HHMMSS` filename when present, then the file's modified
+time. This avoids opening and reading 20,000 image files merely to index them.
+An individually added screenshot may also use its embedded EXIF capture time.
+The original relative source path is retained as a fallback caption. Timeline
+defaults to its newest year and renders 60 events at a time, using lazy-loaded
+images. **All years** and **Load more** remain available, so a large library
+does not decode every image at once. Timeline thumbnails are shown at up to
+360 by 225 pixels. Click one to open the original linked file in the operating
+system's default image viewer; WoW Time Capsule remains on the Timeline.
 
 ### Rebuild or open the HTML album
 
@@ -179,18 +214,21 @@ stored by an older archive schema are migrated into Shared Collections when the
 archive is opened; another API export is not required for that migration.
 
 **Open in Browser** opens the same album outside the desktop app. Its data,
-styles, and scripts are embedded in `index.html`; screenshots use relative
-paths under the archive. It works directly from disk and makes no web requests.
+styles, and scripts are embedded in `index.html`; screenshots use local file
+links to the registered folders. It makes no web requests, but the NAS paths
+must be available to the browser for screenshot images to display.
 
 ### Professions
 
 Professions are stored with their individual expansion skill tiers rather than
 only a single total. The View shows each tier's current and maximum skill and,
-when Blizzard supplies it, the number of known recipes. If the section is empty,
-check **Archive details**: Classic versions may not expose the same profession
-endpoint as Retail. Opening an older archive automatically rebuilds profession
-tiers from its preserved `_professions.json` files, so this fix does not require
-another API export when those files are already present.
+when Blizzard supplies it, an expandable alphabetical list of known recipes.
+Recipe IDs, names, and their original API references are also stored in SQLite.
+If the section is empty, check **Archive details**: Classic versions may not
+expose the same profession endpoint as Retail. Opening an older archive
+automatically rebuilds profession tiers and recipe lists from its preserved
+`_professions.json` files, so this fix does not require another API export when
+those files are already present.
 
 ### Achievement details
 
@@ -199,7 +237,30 @@ category, requirements, reward, and account-wide status. Blizzard's character
 response supplies completion progress and time; the separate Game Data record
 supplies the descriptive reference information. If Blizzard has not published
 a reference record for an achievement, the completion remains saved and the
-missing detail is reported in Capture results.
+missing detail is reported in Capture results. Archives created before this
+feature need one new character export to download those separate reference
+records; **Rebuild HTML** alone cannot invent information that was never saved.
+
+### Completed quests
+
+View includes a searchable, expandable list from the most recent successful
+completed-quest capture for each character. If a later quest request fails, the
+last successfully saved list remains available. Existing SQLite quest records
+are enough: click **Rebuild HTML** and do not re-export them.
+
+Blizzard returns quest IDs and names but no completion timestamps. Timeline
+therefore shows one clearly labelled **completed quests observed** event on the
+archive capture date; that is not presented as the date the quests were
+originally completed.
+
+For each completed quest, the app can also request Blizzard's separate static
+quest record and store its description, category, requirements and original
+reference JSON in SQLite. A character may have thousands of completed quests,
+so the first description-enriched export can take several minutes. Progress is
+shown during export, saved references are reused, and a later export resumes
+only the missing records if Blizzard rate-limits the first attempt. Some quest
+reference IDs return 404 from Blizzard and remain listed by name without a
+description.
 
 ## Timeline
 
@@ -284,7 +345,8 @@ Verification checks SQLite integrity, required raw files and screenshots, safe
 relative paths, and SHA-256 checksums. A successful check ends with:
 
 ```text
-Archive is self-contained.
+Core archive data is self-contained. Screenshot images remain in the registered
+external folders and are not copied.
 ```
 
 ## Troubleshooting
@@ -302,9 +364,34 @@ The account index and character profiles are separate Blizzard records. The
 index can contain an old name, old realm, deleted character, or a character
 whose detailed profile has not been published yet.
 
+The app now tries three levels automatically:
+
+1. Blizzard's public character profile;
+2. the authenticated **protected character** link supplied in your account
+   list; and
+3. a basic snapshot from the authenticated account list itself.
+
+The third level preserves the character's name, realm, game version, level,
+class, race and faction when Blizzard supplied them, but it cannot provide
+equipment, professions, achievements or other detailed sections. Capture
+results distinguish this basic snapshot from the missing detailed profile.
+
+Check **Game Data and Profile Privacy** at
+<https://account.blizzard.com/privacy> and allow your game data to be shared.
+After changing it, log into the affected character, log out cleanly, reconnect
+Battle.net in WoW Time Capsule and export again. Blizzard's Classic protected
+profile service is not as consistently available as Retail, so Classic exports
+may still depend on the public profile being published.
+
 For a recent Hardcore character, use **Add Manual Character**, choose **Classic
 Era / Hardcore / seasonal**, and enter its current realm slug and name. If that
 also returns 404, log into the character, log out cleanly, and try again later.
+
+Old entries commonly refer to deleted, renamed, transferred, or retired
+characters. A character created today can also appear in the account list before
+Blizzard publishes its detailed profile. Manually entered characters have no
+authenticated account-list fallback, so a missing profile still fails
+immediately for those entries.
 
 ### Pets or mounts are empty
 

@@ -9,6 +9,7 @@ from typing import Any
 
 SECTION_LABELS = {
     "character_profile": "Profile",
+    "profile_details": "Detailed profile",
     "equipment": "Equipment",
     "achievements": "Achievements",
     "achievement_details": "Achievement reference details",
@@ -20,6 +21,7 @@ SECTION_LABELS = {
     "reputations": "Reputations",
     "statistics": "Statistics",
     "quests": "Completed quests",
+    "quest_details": "Quest reference details",
 }
 
 GAME_LABELS = {
@@ -36,7 +38,7 @@ def generate_html(root: str | Path) -> Path:
         raise FileNotFoundError("Choose an archive containing wow_archive.sqlite")
     db = sqlite3.connect(database)
     db.row_factory = sqlite3.Row
-    payload = _archive_payload(db)
+    payload = _archive_payload(db, root)
     db.close()
     encoded = json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c")
     target = root / "index.html"
@@ -44,7 +46,7 @@ def generate_html(root: str | Path) -> Path:
     return target
 
 
-def _archive_payload(db: sqlite3.Connection) -> dict[str, Any]:
+def _archive_payload(db: sqlite3.Connection, root: Path) -> dict[str, Any]:
     latest = db.execute("""
         SELECT c.*, s.*
         FROM character c
@@ -64,7 +66,7 @@ def _archive_payload(db: sqlite3.Connection) -> dict[str, Any]:
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "characters": characters,
         "collections": _collections_payload(db),
-        "timeline": _timeline_payload(db),
+        "timeline": _timeline_payload(db, root),
     }
 
 
@@ -100,6 +102,24 @@ def _character_payload(db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, An
         WHERE ca.character_snapshot_id=? AND ca.is_completed=1
         ORDER BY COALESCE(ca.completed_at,'') DESC,a.name COLLATE NOCASE
     """, (sid,))]
+    quest_snapshot = db.execute("""
+        SELECT s.character_snapshot_id,s.observed_at
+        FROM character_snapshot s
+        JOIN archive_run r ON r.archive_run_id=s.archive_run_id AND r.status='complete'
+        JOIN character_quest cq ON cq.character_snapshot_id=s.character_snapshot_id
+        WHERE s.character_id=?
+        GROUP BY s.character_snapshot_id
+        ORDER BY s.observed_at DESC,s.character_snapshot_id DESC LIMIT 1
+    """, (cid,)).fetchone()
+    quests: list[dict[str, Any]] = []
+    quest_observed = None
+    if quest_snapshot:
+        quest_observed = quest_snapshot["observed_at"]
+        quests = [dict(item) for item in db.execute("""
+            SELECT q.quest_id,q.name,q.description,q.category,cq.observed_at
+            FROM character_quest cq JOIN quest q ON q.quest_id=cq.quest_id
+            WHERE cq.character_snapshot_id=? ORDER BY q.name COLLATE NOCASE,q.quest_id
+        """, (quest_snapshot["character_snapshot_id"],))]
     professions = [dict(item) for item in db.execute("""
         SELECT p.profession_id,p.name,cp.skill_points,cp.max_skill_points
         FROM character_profession cp JOIN profession p ON p.profession_id=cp.profession_id
@@ -107,7 +127,8 @@ def _character_payload(db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, An
     """, (sid,))]
     for profession in professions:
         profession["tiers"] = [dict(item) for item in db.execute("""
-            SELECT pt.name,cpt.skill_points,cpt.max_skill_points,cpt.known_recipes
+            SELECT pt.profession_tier_id,pt.name,cpt.skill_points,
+                   cpt.max_skill_points,cpt.known_recipes
             FROM character_profession_tier cpt
             JOIN profession_tier pt
               ON pt.profession_tier_id=cpt.profession_tier_id
@@ -115,6 +136,14 @@ def _character_payload(db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, An
             WHERE cpt.character_snapshot_id=? AND p.profession_id=?
             ORDER BY pt.profession_tier_id DESC
         """, (sid, profession["profession_id"]))]
+        for tier in profession["tiers"]:
+            tier["recipes"] = [dict(item) for item in db.execute("""
+                SELECT r.recipe_id,r.name
+                FROM character_known_recipe ckr
+                JOIN recipe r ON r.recipe_id=ckr.recipe_id
+                WHERE ckr.character_snapshot_id=? AND ckr.profession_tier_id=?
+                ORDER BY r.name COLLATE NOCASE
+            """, (sid, tier["profession_tier_id"]))]
     reputations = [dict(item) for item in db.execute("""
         SELECT r.name,cr.standing,cr.value
         FROM character_reputation cr JOIN reputation r ON r.reputation_id=cr.reputation_id
@@ -135,10 +164,6 @@ def _character_payload(db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, An
         SELECT section_name,status,record_count,detail
         FROM capture_section WHERE character_snapshot_id=? ORDER BY section_name
     """, (sid,))]
-    screenshots = [dict(item) for item in db.execute(
-        "SELECT relative_path,caption,added_at FROM screenshot WHERE character_id=? ORDER BY added_at",
-        (cid,),
-    )]
     memories = [dict(item) for item in db.execute(
         "SELECT title,body,created_at FROM character_memory WHERE character_id=? ORDER BY created_at DESC",
         (cid,),
@@ -160,11 +185,13 @@ def _character_payload(db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, An
         "achievement_points": row["achievement_points"],
         "equipment": equipment,
         "achievements": achievements,
+        "quests": quests,
+        "quest_observed": quest_observed,
         "professions": professions,
         "reputations": reputations,
         "hunter_pets": hunter_pets,
         "outcomes": outcomes,
-        "screenshots": screenshots,
+        "screenshots": [],
         "memories": memories,
     }
 
@@ -204,7 +231,7 @@ def _collections_payload(db: sqlite3.Connection) -> dict[str, Any]:
     return result
 
 
-def _timeline_payload(db: sqlite3.Connection) -> list[dict[str, Any]]:
+def _timeline_payload(db: sqlite3.Connection, root: Path) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
 
     def add(value: Any, kind: str, character: str, realm: str, title: str,
@@ -263,11 +290,43 @@ def _timeline_payload(db: sqlite3.Connection) -> list[dict[str, Any]]:
             row["name"] or "Achievement completed", description)
     for row in db.execute("""
         SELECT c.character_name,COALESCE(c.realm_name,c.realm_slug) AS realm,
-               sc.added_at,sc.caption,sc.relative_path
-        FROM screenshot sc JOIN character c ON c.character_id=sc.character_id
+               s.observed_at,COUNT(cq.quest_id) AS quest_count
+        FROM character c
+        JOIN character_snapshot s ON s.character_id=c.character_id
+        JOIN archive_run r ON r.archive_run_id=s.archive_run_id AND r.status='complete'
+        JOIN character_quest cq ON cq.character_snapshot_id=s.character_snapshot_id
+        WHERE s.character_snapshot_id=(
+            SELECT s2.character_snapshot_id
+            FROM character_snapshot s2
+            JOIN archive_run r2
+              ON r2.archive_run_id=s2.archive_run_id AND r2.status='complete'
+            JOIN character_quest cq2
+              ON cq2.character_snapshot_id=s2.character_snapshot_id
+            WHERE s2.character_id=c.character_id
+            GROUP BY s2.character_snapshot_id
+            ORDER BY s2.observed_at DESC,s2.character_snapshot_id DESC LIMIT 1
+        )
+        GROUP BY c.character_id,s.character_snapshot_id
     """):
-        add(row["added_at"], "screenshot", row["character_name"], row["realm"],
-            row["caption"] or "Screenshot added", "", row["relative_path"])
+        add(
+            row["observed_at"], "quests", row["character_name"], row["realm"],
+            f"{row['quest_count']:,} completed quests observed",
+            "Archive observation date only; Blizzard does not provide quest completion dates.",
+        )
+    for row in db.execute("""
+        SELECT COALESCE(sc.captured_at,sc.added_at) AS screenshot_date,
+               sc.caption,sc.relative_path,sc.source_path
+        FROM screenshot sc WHERE COALESCE(sc.is_available,1)=1
+    """):
+        image_path = Path(row["source_path"] or "")
+        if not image_path.is_absolute():
+            image_path = root / row["relative_path"]
+        try:
+            image = image_path.resolve().as_uri()
+        except ValueError:
+            image = ""
+        add(row["screenshot_date"], "screenshot", "World of Warcraft", "",
+            row["caption"] or "Screenshot added", "", image)
     for row in db.execute("""
         SELECT c.character_name,COALESCE(c.realm_name,c.realm_slug) AS realm,
                m.created_at,m.title,m.body
@@ -332,9 +391,11 @@ main{{max-width:1280px;margin:auto;padding:28px 5vw 60px}} button,input{{font:in
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}} .section{{margin-bottom:16px}} ul{{padding-left:20px}} .facts{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}} .fact{{background:var(--panel2);padding:10px;border-radius:9px}}
 .status{{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px}} .captured{{background:#183b2a;color:var(--ok)}} .request_failed{{background:#442326;color:var(--bad)}} .unavailable{{background:#343947;color:#c6ceda}}
 .gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}} .gallery img{{width:100%;height:170px;object-fit:cover;border-radius:10px}} .memory{{border-left:3px solid var(--gold);padding-left:12px;margin:12px 0}}
-.equipment{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}} .item{{background:var(--panel2);border-radius:8px;padding:9px;margin-bottom:5px}} .slot{{color:var(--gold);font-size:12px}} .achievement-search,select{{width:100%;background:#0d1119;border:1px solid var(--line);color:#fff;padding:10px;border-radius:8px}}
+.gallery-controls{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}} .gallery-controls select{{width:auto;min-width:150px}} figure{{margin:0}} figcaption{{overflow-wrap:anywhere}}
+.equipment{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}} .item{{background:var(--panel2);border-radius:8px;padding:9px;margin-bottom:5px}} .slot{{color:var(--gold);font-size:12px}} .achievement-search,.quest-search,select{{width:100%;background:#0d1119;border:1px solid var(--line);color:#fff;padding:10px;border-radius:8px}}
 .achievement summary{{cursor:pointer}} .achievement .more{{padding:9px 0 2px;color:var(--muted)}} .tiers{{margin:8px 0 0 12px;border-left:2px solid var(--line);padding-left:10px}}
-.timeline{{position:relative;margin-left:18px;border-left:2px solid var(--line);padding-left:26px}} .event{{position:relative;margin:0 0 14px}} .event:before{{content:'';position:absolute;width:11px;height:11px;border-radius:50%;background:var(--gold);left:-33px;top:17px}} .event-head{{display:flex;justify-content:space-between;gap:12px}} .event img{{width:150px;max-height:100px;object-fit:cover;border-radius:8px;margin-top:8px}} .kind{{color:var(--blue);font-size:12px;text-transform:uppercase;letter-spacing:.08em}}
+.quest-list summary{{cursor:pointer;margin:12px 0}} .quest-items{{columns:3 240px;column-gap:12px;max-height:480px;overflow:auto}} .quest{{break-inside:avoid}}
+.timeline{{position:relative;margin-left:18px;border-left:2px solid var(--line);padding-left:26px}} .event{{position:relative;margin:0 0 14px}} .event:before{{content:'';position:absolute;width:11px;height:11px;border-radius:50%;background:var(--gold);left:-33px;top:17px}} .event-head{{display:flex;justify-content:space-between;gap:12px}} .event img{{width:min(100%,360px);max-height:225px;object-fit:cover;border-radius:10px;margin-top:10px;cursor:zoom-in;border:1px solid var(--line)}} .kind{{color:var(--blue);font-size:12px;text-transform:uppercase;letter-spacing:.08em}}
 .scroll{{max-height:370px;overflow:auto}} .empty{{color:var(--muted);font-style:italic}} @media(max-width:700px){{.hero{{grid-template-columns:1fr}}}}
 </style></head><body>
 <header><h1>WoW Time Capsule</h1><div class="muted">A quiet album of preserved character information · Generated <span id="generated"></span></div></header>
@@ -346,15 +407,18 @@ const status=o=>`<span class="status ${{esc(o.status)}}">${{esc(o.status.replace
 function roster(){{document.querySelectorAll('.toolbar button').forEach(x=>x.classList.remove('active'));rosterBtn.classList.add('active');app.innerHTML=`<div class="cards">${{archive.characters.map((c,i)=>{{const shot=c.screenshots[0];return `<div class="card" onclick="character(${{i}})">${{shot?`<img class="avatar" src="${{encodeURI(shot.relative_path)}}">`:`<div class="avatar">${{esc(c.name.slice(0,2).toUpperCase())}}</div>`}}<div><h3>${{esc(c.name)}}</h3><div>${{esc(c.realm)}} · ${{esc(c.region)}}</div><div class="muted">${{esc(c.game)}} · Level ${{esc(c.level??'?')}} ${{esc(c.class_name??'')}}</div><small class="muted">${{esc(c.captured)}}</small></div></div>`}}).join('')}}</div>${{archive.characters.length?'':'<p class="empty">No successful character snapshots are in this archive.</p>'}}`;}}
 function character(i){{const c=archive.characters[i], shot=c.screenshots[0];app.innerHTML=`<button onclick="roster()">← Character roster</button><div class="detail active"><div class="hero section">${{shot?`<img src="${{encodeURI(shot.relative_path)}}">`:`<div class="avatar" style="width:100%;height:210px;font-size:52px">${{esc(c.name.slice(0,2).toUpperCase())}}</div>`}}<div><div class="muted">${{esc(c.game)}}</div><h1>${{esc(c.name)}}</h1><h3>${{esc(c.realm)}} · ${{esc(c.region)}}</h3><div class="facts">${{[['Level',c.level],['Race',c.race],['Class',c.class_name],['Specialization',c.specialization],['Faction',c.faction],['Guild',c.guild],['Achievement points',c.achievement_points],['Captured',c.captured]].map(x=>`<div class="fact"><small class="muted">${{x[0]}}</small><br>${{esc(x[1]??'Not captured')}}</div>`).join('')}}</div></div></div>
 <div class="section"><h2>Overview</h2>${{c.memories.length?c.memories.map(m=>`<div class="memory"><b>${{esc(m.title||'Memory')}}</b><div>${{esc(m.body).split(String.fromCharCode(10)).join('<br>')}}</div><small class="muted">${{esc(m.created_at)}}</small></div>`).join(''):'<p class="empty">No personal notes yet.</p>'}}</div>
+<div class="section"><h2>Completed quests</h2>${{c.quests.length?`<p class="muted">Blizzard returned these as completed when the archive observed them on ${{esc((c.quest_observed||'').slice(0,10))}}. Blizzard does not provide their original completion dates.</p><input class="quest-search" placeholder="Search ${{c.quests.length.toLocaleString()}} completed quests" oninput="filterQuests(this.value)"><details id="questList" class="quest-list"><summary><b>Show ${{c.quests.length.toLocaleString()}} completed quests</b></summary><div class="quest-items">${{c.quests.map(q=>`<details class="quest item" data-name="${{esc(((q.name||'')+' '+(q.description||'')+' '+(q.category||'')).toLowerCase())}}"><summary><b>${{esc(q.name||`Quest ${{q.quest_id}}`)}}</b></summary><div class="more">${{q.description?esc(q.description):'<span class="muted">Description has not been downloaded yet.</span>'}}${{q.category?`<div class="muted">${{esc(q.category)}}</div>`:''}}</div></details>`).join('')}}</div></details>`:'<p class="empty">No completed quest list has been captured for this character.</p>'}}</div>
 <div class="section"><h2>Equipment</h2><div class="equipment">${{c.equipment.map(x=>`<div class="item"><div class="slot">${{esc(x.slot)}}</div>${{esc(x.name)}}${{x.level?` <span class="muted">· ilvl ${{x.level}}</span>`:''}}</div>`).join('')||'<p class="empty">No equipment records captured.</p>'}}</div></div>
-<div class="section"><h2>Achievements</h2><input class="achievement-search" placeholder="Search completed achievements" oninput="filterAchievements(this.value)"><div id="achievementList" class="scroll">${{c.achievements.map(x=>`<details class="achievement item" data-name="${{esc((x.name+' '+(x.description||'')+' '+(x.category||'')).toLowerCase())}}"><summary><b>${{esc(x.name)}}</b>${{x.points?` · ${{x.points}} points`:''}}<div class="muted">${{esc(x.completed||'Completion date unavailable')}}${{x.category?` · ${{esc(x.category)}}`:''}}${{x.account_wide?' · Account-wide':''}}</div></summary><div class="more">${{x.description?`<p>${{esc(x.description)}}</p>`:''}}${{x.requirements?`<b>How to earn it</b><p>${{esc(x.requirements).split(String.fromCharCode(10)).join('<br>')}}</p>`:''}}${{x.reward?`<b>Reward</b><p>${{esc(x.reward)}}</p>`:''}}${{!x.description&&!x.requirements&&!x.reward?'<span>Detailed reference data was not available for this saved achievement.</span>':''}}</div></details>`).join('')||'<p class="empty">No completed achievements captured.</p>'}}</div></div>
-<div class="grid"><div class="section"><h2>Professions</h2>${{c.professions.map(x=>`<div class="item"><b>${{esc(x.name)}}</b>${{x.skill_points!==null?` · ${{esc(x.skill_points)}}/${{esc(x.max_skill_points??'?')}} total`:''}}${{x.tiers.length?`<div class="tiers">${{x.tiers.map(t=>`<div><b>${{esc(t.name||'Skill tier')}}</b> · ${{esc(t.skill_points??'?')}}/${{esc(t.max_skill_points??'?')}}${{t.known_recipes?` · ${{t.known_recipes}} known recipes`:''}}</div>`).join('')}}</div>`:''}}</div>`).join('')||'<p class="empty">No professions captured. Check Archive details to see whether Blizzard returned this section.</p>'}}</div><div class="section"><h2>Reputations</h2><div class="scroll">${{c.reputations.map(x=>`<div class="item"><b>${{esc(x.name)}}</b> · ${{esc(x.standing||x.value||'Captured')}}</div>`).join('')||'<p class="empty">No reputations captured.</p>'}}</div></div></div>
+<div class="section"><h2>Achievements</h2><input class="achievement-search" placeholder="Search completed achievements" oninput="filterAchievements(this.value)"><div id="achievementList" class="scroll">${{c.achievements.map(x=>`<details class="achievement item" data-name="${{esc((x.name+' '+(x.description||'')+' '+(x.category||'')).toLowerCase())}}"><summary><b>${{esc(x.name)}}</b>${{x.points?` · ${{x.points}} points`:''}}<div class="muted">${{esc(x.completed||'Completion date unavailable')}}${{x.category?` · ${{esc(x.category)}}`:''}}${{x.account_wide?' · Account-wide':''}}</div></summary><div class="more">${{x.description?`<b>Description</b><p>${{esc(x.description)}}</p>`:''}}${{x.requirements||x.description?`<b>How to earn it</b><p>${{esc(x.requirements||x.description).split(String.fromCharCode(10)).join('<br>')}}</p>`:''}}${{x.reward?`<b>Reward</b><p>${{esc(x.reward)}}</p>`:''}}${{!x.description&&!x.requirements&&!x.reward?'<span>Detailed reference data was not available for this saved achievement. Export this character again while connected to Battle.net.</span>':''}}</div></details>`).join('')||'<p class="empty">No completed achievements captured.</p>'}}</div></div>
+<div class="grid"><div class="section"><h2>Professions</h2>${{c.professions.length?'<input class="achievement-search" placeholder="Search known recipes" oninput="filterRecipes(this.value)">':''}}${{c.professions.map(x=>`<div class="item"><b>${{esc(x.name)}}</b>${{x.skill_points!==null?` · ${{esc(x.skill_points)}}/${{esc(x.max_skill_points??'?')}} total`:''}}${{x.tiers.length?`<div class="tiers">${{x.tiers.map(t=>`<details class="profession-tier"><summary><b>${{esc(t.name||'Skill tier')}}</b> · ${{esc(t.skill_points??'?')}}/${{esc(t.max_skill_points??'?')}}${{t.recipes.length?` · ${{t.recipes.length}} known recipes`:''}}</summary>${{t.recipes.length?`<ul>${{t.recipes.map(r=>`<li class="recipe" data-name="${{esc((r.name||'').toLowerCase())}}">${{esc(r.name||`Recipe ${{r.recipe_id}}`)}}</li>`).join('')}}</ul>`:'<p class="muted">No known recipes were returned for this tier.</p>'}}</details>`).join('')}}</div>`:''}}</div>`).join('')||'<p class="empty">No professions captured. Check Archive details to see whether Blizzard returned this section.</p>'}}</div><div class="section"><h2>Reputations</h2><div class="scroll">${{c.reputations.map(x=>`<div class="item"><b>${{esc(x.name)}}</b> · ${{esc(x.standing||x.value||'Captured')}}</div>`).join('')||'<p class="empty">No reputations captured.</p>'}}</div></div></div>
 <div class="section"><h2>Hunter companions</h2>${{c.hunter_pets.map(x=>`<div class="item"><b>${{esc(x.name||'Unnamed companion')}}</b>${{x.level?` · Level ${{x.level}}`:''}}${{x.is_active?' · Active':''}}</div>`).join('')||'<p class="empty">No hunter companion records captured.</p>'}}</div>
-<div class="section"><h2>Memories</h2><div class="gallery">${{c.screenshots.map(x=>`<figure><img src="${{encodeURI(x.relative_path)}}"><figcaption>${{esc(x.caption||'')}}</figcaption></figure>`).join('')||'<p class="empty">No screenshots added.</p>'}}</div></div>
 <div class="section"><h2>Archive details</h2>${{c.outcomes.map(o=>`<div class="item"><b>${{esc(o.label)}}</b><br>${{status(o)}}</div>`).join('')||'<p class="empty">This older snapshot has no section diagnostics.</p>'}}</div></div>`;window.scrollTo(0,0);}}
 function showCharacterById(id){{const index=archive.characters.findIndex(c=>c.id===id);if(index>=0)character(index);}}
 function filterAchievements(q){{document.querySelectorAll('.achievement').forEach(x=>x.style.display=x.dataset.name.includes(q.toLowerCase())?'':'none')}}
-function timeline(){{document.querySelectorAll('.toolbar button').forEach(x=>x.classList.remove('active'));timelineBtn.classList.add('active');app.innerHTML=`<h1>Timeline</h1><p class="muted">Achievements, screenshots, memories, archive captures, and Blizzard's last-login time when available. This is not a complete play-session history.</p><div class="section"><select id="timelineFilter" onchange="renderTimeline(this.value)"><option value="">All events</option><option value="played">Played</option><option value="achievement">Achievements</option><option value="screenshot">Screenshots</option><option value="memory">Memories</option><option value="capture">Archive captures</option></select></div><div id="timelineEvents" class="timeline"></div>`;renderTimeline('');}}
-function renderTimeline(kind){{const target=document.getElementById('timelineEvents');if(!target)return;const events=archive.timeline.filter(x=>!kind||x.kind===kind);target.innerHTML=events.map(x=>`<article class="event section"><div class="event-head"><div><div class="kind">${{esc(x.kind)}}</div><h3>${{esc(x.title)}}</h3><div>${{esc(x.character)}}${{x.realm?` · ${{esc(x.realm)}}`:''}}</div></div><time class="muted">${{esc(x.day)}}</time></div>${{x.detail?`<p>${{esc(x.detail)}}</p>`:''}}${{x.image?`<img src="${{encodeURI(x.image)}}">`:''}}</article>`).join('')||'<p class="empty">No dated events of this type are saved.</p>';window.scrollTo(0,0);}}
+function filterQuests(q){{const needle=q.toLowerCase(),list=document.getElementById('questList');document.querySelectorAll('.quest').forEach(x=>x.style.display=x.dataset.name.includes(needle)?'':'none');if(list&&needle)list.open=true;}}
+function filterRecipes(q){{const needle=q.toLowerCase();document.querySelectorAll('.recipe').forEach(x=>x.style.display=x.dataset.name.includes(needle)?'':'none');document.querySelectorAll('.profession-tier').forEach(x=>{{const match=[...x.querySelectorAll('.recipe')].some(r=>r.style.display!=='none');if(needle)x.open=match;}});}}
+let timelineLimit=60;
+function timeline(){{document.querySelectorAll('.toolbar button').forEach(x=>x.classList.remove('active'));timelineBtn.classList.add('active');const years=[...new Set(archive.timeline.map(x=>x.day.slice(0,4)))].sort().reverse();app.innerHTML=`<h1>Timeline</h1><p class="muted">Achievements, screenshots, memories, archive captures, quest observations, and Blizzard's last-login time when available. Quest events use the archive observation date because Blizzard supplies no completion dates.</p><div class="section gallery-controls"><label>Event <select id="timelineFilter" onchange="renderTimeline(true)"><option value="">All events</option><option value="played">Played</option><option value="achievement">Achievements</option><option value="quests">Completed quests observed</option><option value="screenshot">Screenshots</option><option value="memory">Memories</option><option value="capture">Archive captures</option></select></label><label>Year <select id="timelineYear" onchange="renderTimeline(true)">${{years.map((y,n)=>`<option value="${{esc(y)}}"${{n===0?' selected':''}}>${{esc(y)}}</option>`).join('')}}<option value="">All years</option></select></label></div><div id="timelineEvents" class="timeline"></div><div id="timelineMore"></div>`;timelineLimit=60;renderTimeline(false);}}
+function renderTimeline(reset){{if(reset)timelineLimit=60;const target=document.getElementById('timelineEvents');if(!target)return;const kind=document.getElementById('timelineFilter')?.value??'',year=document.getElementById('timelineYear')?.value??'',events=archive.timeline.filter(x=>(!kind||x.kind===kind)&&(!year||x.day.startsWith(year))),shown=events.slice(0,timelineLimit);target.innerHTML=shown.map(x=>`<article class="event section"><div class="event-head"><div><div class="kind">${{esc(x.kind)}}</div><h3>${{esc(x.title)}}</h3><div>${{esc(x.character)}}${{x.realm?` · ${{esc(x.realm)}}`:''}}</div></div><time class="muted">${{esc(x.day)}}</time></div>${{x.detail?`<p>${{esc(x.detail)}}</p>`:''}}${{x.image?`<a href="${{esc(x.image)}}" title="Open full image in the default viewer"><img loading="lazy" decoding="async" src="${{esc(x.image)}}" alt="${{esc(x.title)}}"></a>`:''}}</article>`).join('')||'<p class="empty">No dated events of this type are saved.</p>';document.getElementById('timelineMore').innerHTML=shown.length<events.length?`<button onclick="timelineLimit+=60;renderTimeline(false)">Load 60 more (${{(events.length-shown.length).toLocaleString()}} remaining)</button>`:'';if(reset)window.scrollTo(0,0);}}
 function collections(){{document.querySelectorAll('.toolbar button').forEach(x=>x.classList.remove('active'));collectionsBtn.classList.add('active');const block=(title,c)=>`<div class="section"><h2>${{title}}</h2>${{status({{status:c.status,count:c.records.length,detail:c.detail}})}}${{c.using_previous_capture?'<p class="muted">Showing the most recent successful saved collection because the latest request failed.</p>':''}}<div class="scroll">${{c.records.map(x=>`<div class="item"><b>${{esc(x.name)}}</b>${{x.species&&x.species!==x.name?` · ${{esc(x.species)}}`:''}}${{x.level?` · Level ${{x.level}}`:''}}</div>`).join('')||'<p class="empty">No saved records.</p>'}}</div></div>`;app.innerHTML=`<h1>Shared Collections</h1><p class="muted">Account collections are shown once and are not attributed to an individual character.</p><div class="grid">${{block('Battle pets',archive.collections.pets)}}${{block('Mounts',archive.collections.mounts)}}</div>`;}}
 rosterBtn.onclick=roster;timelineBtn.onclick=timeline;collectionsBtn.onclick=collections;location.hash==='#timeline'?timeline():roster();</script></body></html>"""

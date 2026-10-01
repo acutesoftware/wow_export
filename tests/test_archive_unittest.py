@@ -75,7 +75,15 @@ class ArchiveTests(unittest.TestCase):
             duplicate_quest = {"id": 1234, "name": "A Quest Blizzard Listed Twice"}
             captured = {
                 "character_profile": {"level": 80},
-                "quests": {"quests": [duplicate_quest, duplicate_quest]},
+                "quests": {
+                    "quests": [duplicate_quest, duplicate_quest],
+                    "_reference_details": {"1234": {
+                        "id": 1234,
+                        "title": "A Quest Blizzard Listed Twice",
+                        "description": "Complete the important test objective.",
+                        "category": {"name": "Testing"},
+                    }},
+                },
             }
             with archive.run(region="us", locale="en_US") as run_id:
                 archive.save_raw(run_id, "character_profile", "/profile", captured["character_profile"], 200)
@@ -87,6 +95,11 @@ class ArchiveTests(unittest.TestCase):
             ).fetchone()[0]
             self.assertEqual(count, 1)
             archive.close()
+
+            page = generate_html(folder).read_text(encoding="utf-8")
+            self.assertIn("A Quest Blizzard Listed Twice", page)
+            self.assertIn("Complete the important test objective.", page)
+            self.assertIn('"kind": "quests"', page)
 
     def test_shared_collections_hunter_pets_outcomes_and_html(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -130,7 +143,11 @@ class ArchiveTests(unittest.TestCase):
             archive.add_memory(character_id, "First tame", "Met Bitey in the forest.")
             image = root / "source.png"
             image.write_bytes(b"not-a-real-image-but-preserved")
-            saved_image = archive.add_screenshot(character_id, image, "At home")
+            saved_image = archive.add_screenshot(image, "At home")
+            self.assertNotIn(
+                "character_id",
+                {row[1] for row in archive.db.execute("PRAGMA table_info(screenshot)")},
+            )
             self.assertEqual(
                 archive.db.execute("SELECT count(*) FROM character_hunter_pet").fetchone()[0], 1
             )
@@ -152,10 +169,101 @@ class ArchiveTests(unittest.TestCase):
             self.assertNotIn("src=\"http", page)
             valid, messages = verify(root)
             self.assertTrue(valid, "\n".join(messages))
-            saved_image.write_bytes(b"changed")
+            saved_image.unlink()
             valid, messages = verify(root)
             self.assertFalse(valid)
-            self.assertTrue(any("Checksum mismatch" in line for line in messages))
+            self.assertTrue(any("Missing screenshot link" in line for line in messages))
+
+    def test_screenshot_folder_import_is_recursive_deduplicated_and_dated(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            root = base / "archive"
+            sources = base / "screenshots"
+            nested = sources / "older"
+            nested.mkdir(parents=True)
+            first = sources / "WoWScrnShot_010224_030405.jpg"
+            first.write_bytes(b"first-image")
+            duplicate = nested / "same-content.jpg"
+            duplicate.write_bytes(b"first-image")
+            second = nested / "WoWScrnShot_123123_235959.png"
+            second.write_bytes(b"second-image")
+
+            archive = Archive(root)
+            character = CharacterRef("us", 1, "realm", "Realm", 42, "Photographer")
+            with archive.run(region="us", locale="en_US") as run_id:
+                archive.import_capture(
+                    run_id, character, {"character_profile": {"level": 80}}
+                )
+            character_id = archive.db.execute(
+                "SELECT character_id FROM character WHERE character_name='Photographer'"
+            ).fetchone()[0]
+            result = archive.import_screenshot_folder(sources)
+
+            self.assertEqual(result["scanned"], 3)
+            self.assertEqual(result["imported"], 3)
+            self.assertEqual(result["unchanged"], 0)
+            rows = archive.db.execute(
+                "SELECT captured_at,source_path FROM screenshot ORDER BY captured_at"
+            ).fetchall()
+            self.assertEqual(len(rows), 3)
+            self.assertTrue(any(item[0].startswith("2023-12-31T23:59:59") for item in rows))
+            self.assertTrue(any(item[0].startswith("2024-01-02T03:04:05") for item in rows))
+            self.assertTrue(all(Path(item[1]).is_absolute() for item in rows))
+            self.assertFalse((root / "media" / "screenshots").exists())
+            rescanned = archive.rescan_screenshot_folders()
+            self.assertEqual(rescanned["imported"], 0)
+            self.assertEqual(rescanned["unchanged"], 3)
+            duplicate.unlink()
+            rescanned = archive.rescan_screenshot_folders()
+            self.assertEqual(rescanned["missing"], 1)
+            archive.close()
+
+            page = generate_html(root).read_text(encoding="utf-8")
+            self.assertIn("Load 60 more", page)
+            self.assertIn('loading="lazy"', page)
+            self.assertIn("2024", page)
+            self.assertIn('"character": "World of Warcraft"', page)
+            self.assertIn(first.resolve().as_uri(), page)
+            self.assertNotIn("encodeURI(x.image)", page)
+            self.assertIn("Open full image in the default viewer", page)
+            self.assertIn("width:min(100%,360px)", page)
+
+    def test_character_linked_screenshots_migrate_to_global_timeline(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Path(folder) / "wow_archive.sqlite"
+            db = sqlite3.connect(database)
+            db.executescript("""
+                CREATE TABLE character (
+                    character_id INTEGER PRIMARY KEY, blizzard_character_id INTEGER,
+                    region TEXT NOT NULL, realm_id INTEGER, realm_slug TEXT NOT NULL,
+                    realm_name TEXT, character_name TEXT NOT NULL,
+                    namespace TEXT NOT NULL DEFAULT 'profile', first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    UNIQUE(region,realm_slug,character_name,namespace)
+                );
+                INSERT INTO character VALUES(
+                    1,42,'us',1,'realm','Realm','Old Link','profile','x','x'
+                );
+                CREATE TABLE screenshot (
+                    screenshot_id INTEGER PRIMARY KEY,
+                    character_id INTEGER NOT NULL REFERENCES character,
+                    relative_path TEXT NOT NULL UNIQUE, caption TEXT,
+                    added_at TEXT NOT NULL, sha256 TEXT
+                );
+                INSERT INTO screenshot VALUES(
+                    1,1,'media/screenshots/old.jpg','Old screenshot',
+                    '2020-01-01T00:00:00Z','digest'
+                );
+            """)
+            db.commit()
+            db.close()
+
+            archive = Archive(folder)
+            self.assertNotIn(
+                "character_id",
+                {row[1] for row in archive.db.execute("PRAGMA table_info(screenshot)")},
+            )
+            archive.close()
 
     def test_existing_character_table_is_migrated_with_namespace(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -214,7 +322,10 @@ class ArchiveTests(unittest.TestCase):
                     "tiers": [{
                         "tier": {"id": 2822, "name": "Khaz Algar Blacksmithing"},
                         "skill_points": 75, "max_skill_points": 100,
-                        "known_recipes": [{"id": 1}, {"id": 2}],
+                        "known_recipes": [
+                            {"id": 1, "name": "Forged Practice Blade"},
+                            {"id": 2, "name": "Tempered Test Shield"},
+                        ],
                     }],
                 }]},
                 "_outcomes": {
@@ -238,7 +349,7 @@ class ArchiveTests(unittest.TestCase):
             archive.add_memory(character_id, "The old forge", "Made my first sword.")
             image = root / "forge.png"
             image.write_bytes(b"image")
-            archive.add_screenshot(character_id, image, "At the forge")
+            archive.add_screenshot(image, "At the forge")
             tier = archive.db.execute("""
                 SELECT p.name,pt.name,cpt.skill_points,cpt.max_skill_points,cpt.known_recipes
                 FROM character_profession_tier cpt
@@ -255,6 +366,14 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(
                 achievement, ("Reach level 10.", "Reach level 10", "A fine tabard")
             )
+            recipes = archive.db.execute(
+                "SELECT name FROM recipe ORDER BY name"
+            ).fetchall()
+            self.assertEqual(
+                recipes, [("Forged Practice Blade",), ("Tempered Test Shield",)]
+            )
+            archive.db.execute("DELETE FROM character_known_recipe")
+            archive.db.execute("DELETE FROM recipe")
             archive.db.execute("DELETE FROM character_profession_tier")
             archive.db.commit()
             archive.close()
@@ -266,10 +385,15 @@ class ArchiveTests(unittest.TestCase):
                 ).fetchone()[0],
                 1,
             )
+            self.assertEqual(
+                archive.db.execute("SELECT count(*) FROM character_known_recipe").fetchone()[0],
+                2,
+            )
             archive.close()
 
             page = generate_html(root).read_text(encoding="utf-8")
             self.assertIn("Khaz Algar Blacksmithing", page)
+            self.assertIn("Forged Practice Blade", page)
             self.assertIn("How to earn it", page)
             self.assertIn("A fine tabard", page)
             self.assertIn('"kind": "played"', page)
