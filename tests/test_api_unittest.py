@@ -60,7 +60,62 @@ class BlizzardAPITests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "profile-classic1x-us"):
             api.capture_character(character, lambda *_args: None)
         self.assertTrue(requested)
-        self.assertEqual(set(requested), {"profile-classic1x"})
+        self.assertEqual(set(requested), {"profile-classic1x", "profile"})
+
+    def test_account_collections_use_retail_namespace_for_classic_character(self):
+        api = BlizzardAPI.__new__(BlizzardAPI)
+        api.region = "us"
+        api.locale = "en_US"
+        requested = []
+
+        def fake_get(path, namespace="profile"):
+            requested.append((path, namespace))
+            if path.endswith("/hunter-pets"):
+                return {"hunter_pets": []}, 200
+            if path.endswith("/collections/pets"):
+                return {"pets": []}, 200
+            if path.endswith("/collections/mounts"):
+                return {"mounts": []}, 200
+            return {}, 200
+
+        api.get = fake_get
+        character = CharacterRef(
+            "us", None, "doomhowl", "Doomhowl", None, "Example", 60,
+            "Hunter", "profile-classic1x", 3,
+        )
+        captured = api.capture_character(character, lambda *_args: None)
+
+        collection_namespaces = {
+            namespace for path, namespace in requested if "/profile/user/wow/collections/" in path
+        }
+        character_namespaces = {
+            namespace for path, namespace in requested if "/profile/wow/character/" in path
+        }
+        self.assertEqual(collection_namespaces, {"profile"})
+        self.assertEqual(character_namespaces, {"profile-classic1x"})
+        self.assertEqual(captured["_outcomes"]["pets"]["count"], 0)
+        self.assertEqual(captured["_outcomes"]["hunter_pets"]["status"], "captured")
+
+    def test_non_hunter_pet_capture_is_unavailable_not_failed(self):
+        api = BlizzardAPI.__new__(BlizzardAPI)
+        api.region = "us"
+        api.locale = "en_US"
+        requested = []
+
+        def fake_get(path, namespace="profile"):
+            requested.append(path)
+            return {}, 200
+
+        api.get = fake_get
+        character = CharacterRef(
+            "us", None, "realm", "Realm", None, "Mage", 80,
+            "Mage", "profile", 8,
+        )
+        captured = api.capture_character(character, lambda *_args: None)
+
+        self.assertNotIn("/profile/wow/character/realm/mage/hunter-pets", requested)
+        self.assertEqual(captured["_outcomes"]["hunter_pets"]["status"], "unavailable")
+        self.assertIsNone(captured["_outcomes"]["hunter_pets"]["count"])
 
 
 if __name__ == "__main__":

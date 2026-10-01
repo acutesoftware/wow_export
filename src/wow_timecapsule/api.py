@@ -26,6 +26,7 @@ class CharacterRef:
     level: int | None = None
     playable_class: str = ""
     namespace: str = "profile"
+    playable_class_id: int | None = None
 
     @property
     def game_version(self) -> str:
@@ -73,6 +74,7 @@ class BlizzardAPI:
                         self.region, realm.get("id"), realm.get("slug", ""), realm.get("name", ""),
                         char.get("id"), char.get("name", ""), char.get("level"),
                         char.get("playable_class", {}).get("name", ""), namespace,
+                        char.get("playable_class", {}).get("id"),
                     ))
         raw: dict[str, Any] = {"namespaces": sources}
         if failures:
@@ -82,26 +84,47 @@ class BlizzardAPI:
     def capture_character(self, character: CharacterRef, save: Callable[[str, str, dict, int], None]) -> dict[str, dict]:
         base = f"/profile/wow/character/{character.realm_slug.lower()}/{character.name.lower()}"
         endpoints = {
-            "character_profile": base,
-            "achievements": base + "/achievements",
-            "equipment": base + "/equipment",
-            "appearance": base + "/appearance",
-            "pets": "/profile/user/wow/collections/pets",
-            "mounts": "/profile/user/wow/collections/mounts",
-            "professions": base + "/professions",
-            "reputations": base + "/reputations",
-            "statistics": base + "/statistics",
-            "quests": base + "/quests/completed",
+            "character_profile": (base, character.namespace),
+            "achievements": (base + "/achievements", character.namespace),
+            "equipment": (base + "/equipment", character.namespace),
+            "appearance": (base + "/appearance", character.namespace),
+            "hunter_pets": (base + "/hunter-pets", character.namespace),
+            # These are account collections. They use the account/Retail profile
+            # namespace even when the selected character is Classic.
+            "pets": ("/profile/user/wow/collections/pets", "profile"),
+            "mounts": ("/profile/user/wow/collections/mounts", "profile"),
+            "professions": (base + "/professions", character.namespace),
+            "reputations": (base + "/reputations", character.namespace),
+            "statistics": (base + "/statistics", character.namespace),
+            "quests": (base + "/quests/completed", character.namespace),
         }
         captured: dict[str, dict] = {}
         failures: dict[str, str] = {}
-        for name, endpoint in endpoints.items():
+        outcomes: dict[str, dict[str, Any]] = {}
+        for name, (endpoint, namespace) in endpoints.items():
+            if name == "hunter_pets" and character.playable_class_id not in (None, 3):
+                outcomes[name] = {
+                    "status": "unavailable",
+                    "count": None,
+                    "detail": "Not applicable: this character is not a Hunter.",
+                }
+                continue
             try:
-                data, status = self.get(endpoint, character.namespace)
+                data, status = self.get(endpoint, namespace)
                 save(name, endpoint, data, status)
                 captured[name] = data
+                outcomes[name] = {
+                    "status": "captured",
+                    "count": self._record_count(name, data),
+                    "detail": "",
+                }
             except httpx.HTTPError as exc:
                 failures[name] = str(exc)
+                outcomes[name] = {
+                    "status": "request_failed",
+                    "count": None,
+                    "detail": str(exc),
+                }
         if "character_profile" not in captured:
             namespace = f"{character.namespace}-{self.region}"
             raise RuntimeError(
@@ -113,4 +136,24 @@ class BlizzardAPI:
             )
         if failures:
             captured["_failures"] = failures
+        captured["_outcomes"] = outcomes
         return captured
+
+    @staticmethod
+    def _record_count(name: str, data: dict[str, Any]) -> int | None:
+        keys = {
+            "achievements": "achievements",
+            "equipment": "equipped_items",
+            "hunter_pets": "hunter_pets",
+            "pets": "pets",
+            "mounts": "mounts",
+            "reputations": "reputations",
+            "quests": "quests",
+        }
+        if name == "professions":
+            return len(data.get("primaries", [])) + len(data.get("secondaries", []))
+        key = keys.get(name)
+        if key:
+            value = data.get(key, [])
+            return len(value) if isinstance(value, list) else 0
+        return 1

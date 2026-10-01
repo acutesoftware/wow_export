@@ -19,7 +19,7 @@ def verify(root: str | Path) -> tuple[bool, list[str]]:
     root = Path(root).resolve()
     db_path = root / "wow_archive.sqlite"
     errors: list[str] = []
-    counts = {"Characters": 0, "Snapshots": 0, "Pets": 0, "Raw API files": 0}
+    counts = {"Characters": 0, "Snapshots": 0, "Pets": 0, "Raw API files": 0, "Screenshots": 0}
     if not db_path.is_file():
         return False, ["Database ........ MISSING", "Archive is not self-contained."]
     try:
@@ -32,12 +32,21 @@ def verify(root: str | Path) -> tuple[bool, list[str]]:
         counts["Pets"] = db.execute("SELECT count(*) FROM pet").fetchone()[0]
         records = list(db.execute("SELECT relative_path,sha256 FROM raw_api_file"))
         counts["Raw API files"] = len(records)
+        screenshot_columns = {row[1] for row in db.execute("PRAGMA table_info(screenshot)")}
+        if "sha256" in screenshot_columns:
+            screenshots = list(db.execute("SELECT relative_path,sha256 FROM screenshot"))
+        elif screenshot_columns:
+            screenshots = list(db.execute("SELECT relative_path,NULL FROM screenshot"))
+        else:
+            screenshots = []
+        counts["Screenshots"] = len(screenshots)
+        records.extend(screenshots)
         for relative, expected in records:
             if Path(relative).is_absolute() or ".." in Path(relative).parts:
                 errors.append(f"Unsafe stored path: {relative}"); continue
             path = root / relative
             if not path.is_file(): errors.append(f"Missing file: {relative}")
-            elif digest(path) != expected: errors.append(f"Checksum mismatch: {relative}")
+            elif expected and digest(path) != expected: errors.append(f"Checksum mismatch: {relative}")
         for (stored,) in db.execute("SELECT relative_path FROM raw_api_file"):
             if os.path.isabs(stored): errors.append(f"Absolute path in raw_api_file: {stored}")
         db.close()
