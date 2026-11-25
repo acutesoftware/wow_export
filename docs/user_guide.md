@@ -183,6 +183,8 @@ The **View** tab is the default and does not connect to Battle.net.
    reputations, hunter companions, memories, and capture details.
 4. Choose **Shared Collections** for account pets and mounts.
 
+![WoW Time Capsule's View tab with archive controls and character cards](screenshot_wow_time_capsule_main.png)
+
 The album uses the latest successful saved snapshot for each character and
 shows its capture date. It does not create comparisons, reminders, or daily
 tracking.
@@ -226,6 +228,8 @@ archive is opened; another API export is not required for that migration.
 styles, and scripts are embedded in `index.html`; screenshots use local file
 links to the registered folders. It makes no web requests, but the NAS paths
 must be available to the browser for screenshot images to display.
+
+![A WoW Forever character in the exported HTML album on the left and Blizzard's Armory on the right](screenshot_armory_vs_export_html.png)
 
 ### Professions
 
@@ -282,8 +286,12 @@ Battle.net. It combines:
 - successful character capture dates; and
 - Blizzard's reported last-login time, when present in the profile response.
 
-Use the event-type list to filter the timeline. Blizzard does not provide a
-complete history of login sessions or hours played, so **Last played** is a
+Use the event-type list to filter the timeline.
+
+![Timeline filtered to Screenshots, showing dated entries with in-game thumbnails](screenshot_wow_screenshot_samples.png)
+
+Blizzard does not provide a complete history of login sessions or hours played,
+so **Last played** is a
 single reported timestamp—not a reconstructed play log. Repeated exports can
 add more capture points but do not manufacture missing play dates. Account-wide
 achievements are labelled and de-duplicated rather than being attributed to
