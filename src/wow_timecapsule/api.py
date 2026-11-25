@@ -8,11 +8,14 @@ import httpx
 
 
 REGION_HOSTS = {"us": "us.api.blizzard.com", "eu": "eu.api.blizzard.com", "kr": "kr.api.blizzard.com", "tw": "tw.api.blizzard.com"}
-PROFILE_NAMESPACES = ("profile", "profile-classic", "profile-classic1x")
+PROFILE_NAMESPACES = (
+    "profile", "profile-classic", "profile-classic1x", "profile-forever",
+)
 PROFILE_LABELS = {
     "profile": "Retail",
     "profile-classic": "Classic progression",
     "profile-classic1x": "Classic Era / Hardcore / seasonal",
+    "profile-forever": "WoW Forever",
 }
 
 
@@ -34,6 +37,17 @@ class CharacterRef:
     faction: str = ""
     gender: str = ""
     protected_namespace: str = "profile"
+    surname: str = ""
+
+    @property
+    def display_name(self) -> str:
+        return " ".join(part for part in (self.name, self.surname) if part)
+
+    @property
+    def profile_slug(self) -> str:
+        if self.namespace == "profile-forever":
+            return "-".join(part for part in (self.name, self.surname) if part).lower()
+        return self.name.lower()
 
     @property
     def game_version(self) -> str:
@@ -74,9 +88,13 @@ class BlizzardAPI:
                 failures[qualified] = str(exc)
                 continue
             sources[qualified] = data
-            for account in data.get("wow_accounts", []):
+            accounts = data.get("wow_accounts", [])
+            if not accounts and isinstance(data.get("characters"), list):
+                accounts = [{"characters": data["characters"]}]
+            for account in accounts:
                 for char in account.get("characters", []):
-                    realm = char.get("realm", {})
+                    is_forever = namespace == "profile-forever"
+                    realm = char.get("ruleset", {}) if is_forever else char.get("realm", {})
                     protected_href = char.get("protected_character", {}).get("href", "")
                     protected_url = urlparse(protected_href) if protected_href else None
                     protected_path = protected_url.path if protected_url else ""
@@ -98,6 +116,7 @@ class BlizzardAPI:
                         char.get("faction", {}).get("name", ""),
                         char.get("gender", {}).get("name", ""),
                         protected_namespace,
+                        char.get("surname", "") if is_forever else "",
                     ))
         raw: dict[str, Any] = {"namespaces": sources}
         if failures:
@@ -111,7 +130,10 @@ class BlizzardAPI:
         progress: Callable[[str], None] | None = None,
         known_quest_ids: set[int] | None = None,
     ) -> dict[str, dict]:
-        base = f"/profile/wow/character/{character.realm_slug.lower()}/{character.name.lower()}"
+        if character.namespace == "profile-forever":
+            base = f"/profile/wow/character/{character.profile_slug}"
+        else:
+            base = f"/profile/wow/character/{character.realm_slug.lower()}/{character.profile_slug}"
         endpoints = {
             "character_profile": (base, character.namespace),
             "achievements": (base + "/achievements", character.namespace),
@@ -131,11 +153,18 @@ class BlizzardAPI:
         failures: dict[str, str] = {}
         outcomes: dict[str, dict[str, Any]] = {}
         for name, (endpoint, namespace) in endpoints.items():
-            if name == "hunter_pets" and character.playable_class_id not in (None, 3):
+            if name == "hunter_pets" and (
+                character.namespace == "profile-forever"
+                or character.playable_class_id not in (None, 3)
+            ):
                 outcomes[name] = {
                     "status": "unavailable",
                     "count": None,
-                    "detail": "Not applicable: this character is not a Hunter.",
+                    "detail": (
+                        "Blizzard does not expose hunter pets for WoW Forever."
+                        if character.namespace == "profile-forever"
+                        else "Not applicable: this character is not a Hunter."
+                    ),
                 }
                 continue
             if progress:
@@ -209,7 +238,7 @@ class BlizzardAPI:
         if "character_profile" not in captured:
             namespace = f"{character.namespace}-{self.region}"
             raise RuntimeError(
-                f"Blizzard has no profile for {character.name} — {character.realm_name or character.realm_slug} "
+                f"Blizzard has no profile for {character.display_name} — {character.realm_name or character.realm_slug} "
                 f"in {character.game_version} ({namespace}). The account list can contain deleted, "
                 "renamed, transferred, or not-yet-published characters. If the game version is wrong, "
                 "add the character manually with the correct version. Original error: "
@@ -312,16 +341,25 @@ class BlizzardAPI:
             "id": character.character_id,
             "name": character.name,
             "level": character.level,
-            "realm": {
-                "id": character.realm_id,
-                "slug": character.realm_slug,
-                "name": character.realm_name,
-            },
             "character_class": {
                 "id": character.playable_class_id,
                 "name": character.playable_class,
             },
         }
+        if character.surname:
+            profile["surname"] = character.surname
+            profile["name_search"] = character.display_name
+        if character.namespace == "profile-forever" and character.realm_name:
+            profile["ruleset"] = {
+                "id": character.realm_id,
+                "name": character.realm_name,
+            }
+        elif character.namespace != "profile-forever":
+            profile["realm"] = {
+                "id": character.realm_id,
+                "slug": character.realm_slug,
+                "name": character.realm_name,
+            }
         if character.playable_race or character.playable_race_id is not None:
             profile["race"] = {
                 "id": character.playable_race_id, "name": character.playable_race,

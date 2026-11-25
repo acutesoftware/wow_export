@@ -244,7 +244,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Characters — select one or more rows"))
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Game", "Realm", "Character", "Level", "Class"])
+        self.table.setHorizontalHeaderLabels(["Game", "Realm / Ruleset", "Character", "Level", "Class"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSortIndicatorShown(False)
         self.table.horizontalHeader().sectionClicked.connect(self._sort_by_column)
@@ -345,7 +345,7 @@ class MainWindow(QMainWindow):
             values = (
                 char.game_version,
                 char.realm_name,
-                char.name,
+                char.display_name,
                 char.level,
                 char.playable_class,
             )
@@ -382,12 +382,13 @@ class MainWindow(QMainWindow):
         game.addItem("Retail", "profile")
         game.addItem("Classic progression", "profile-classic")
         game.addItem("Classic Era / Hardcore / seasonal", "profile-classic1x")
+        game.addItem("WoW Forever", "profile-forever")
         realm = QLineEdit()
         name = QLineEdit()
         form.addRow("Region", region)
         form.addRow("Game version", game)
-        form.addRow("Realm slug", realm)
-        form.addRow("Character name", name)
+        form.addRow("Realm slug / Forever surname", realm)
+        form.addRow("Character first name", name)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -395,10 +396,15 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         form.addRow(buttons)
         if dialog.exec() and realm.text().strip() and name.text().strip():
+            namespace = str(game.currentData())
+            is_forever = namespace == "profile-forever"
             self.characters.append(
                 CharacterRef(
-                    region.currentText(), None, realm.text().strip(), realm.text().strip(),
-                    None, name.text().strip(), namespace=str(game.currentData())
+                    region.currentText(), None,
+                    "" if is_forever else realm.text().strip(),
+                    "" if is_forever else realm.text().strip(),
+                    None, name.text().strip(), namespace=namespace,
+                    surname=realm.text().strip() if is_forever else "",
                 )
             )
             self._populate()
@@ -437,7 +443,7 @@ class MainWindow(QMainWindow):
                 archive = None
                 try:
                     self.events.progress.emit(
-                        f"Exporting {position}/{total}: {char.name} — starting profile"
+                        f"Exporting {position}/{total}: {char.display_name} — starting profile"
                     )
                     archive = Archive(archive_path)
                     with archive.run(region=char.region, locale=self.config.locale) as run_id:
@@ -454,16 +460,16 @@ class MainWindow(QMainWindow):
                             ),
                             archive.achievement_reference_ids(),
                             lambda stage, char=char, position=position: self.events.progress.emit(
-                                f"Exporting {position}/{total}: {char.name} — {stage}"
+                                f"Exporting {position}/{total}: {char.display_name} — {stage}"
                             ),
                             archive.quest_reference_ids(),
                         )
                         snapshot_id = archive.import_capture(run_id, char, captured, observed)
                         sections = archive.capture_summary(snapshot_id)
-                    summaries.append({"character": char.name, "sections": sections})
+                    summaries.append({"character": char.display_name, "sections": sections})
                 except Exception as exc:
                     summaries.append({
-                        "character": char.name,
+                        "character": char.display_name,
                         "sections": [{
                             "section": "export", "status": "request_failed",
                             "count": None, "detail": str(exc),

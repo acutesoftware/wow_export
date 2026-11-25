@@ -259,12 +259,16 @@ class Archive:
     def import_capture(self, run_id: int, character: CharacterRef, captured: dict[str, dict], observed: str | None = None) -> int:
         observed = observed or now()
         profile = captured["character_profile"]
-        row = self.db.execute("SELECT character_id FROM character WHERE region=? AND realm_slug=? AND character_name=? COLLATE NOCASE AND namespace=?", (character.region, character.realm_slug, character.name, character.namespace)).fetchone()
+        character_name = character.display_name
+        location = profile.get("ruleset", {}) if character.namespace == "profile-forever" else {}
+        realm_id = location.get("id", character.realm_id)
+        realm_name = location.get("name", character.realm_name)
+        row = self.db.execute("SELECT character_id FROM character WHERE region=? AND realm_slug=? AND character_name=? COLLATE NOCASE AND namespace=?", (character.region, character.realm_slug, character_name, character.namespace)).fetchone()
         if row:
             character_id = row[0]
-            self.db.execute("UPDATE character SET last_seen_at=?,blizzard_character_id=COALESCE(?,blizzard_character_id),realm_name=COALESCE(NULLIF(?,''),realm_name) WHERE character_id=?", (observed, character.character_id, character.realm_name, character_id))
+            self.db.execute("UPDATE character SET last_seen_at=?,blizzard_character_id=COALESCE(?,blizzard_character_id),realm_id=COALESCE(?,realm_id),realm_name=COALESCE(NULLIF(?,''),realm_name) WHERE character_id=?", (observed, character.character_id, realm_id, realm_name, character_id))
         else:
-            character_id = self.db.execute("INSERT INTO character(blizzard_character_id,region,realm_id,realm_slug,realm_name,character_name,namespace,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?,?,?,?)", (character.character_id, character.region, character.realm_id, character.realm_slug, character.realm_name, character.name, character.namespace, observed, observed)).lastrowid
+            character_id = self.db.execute("INSERT INTO character(blizzard_character_id,region,realm_id,realm_slug,realm_name,character_name,namespace,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?,?,?,?)", (character.character_id, character.region, realm_id, character.realm_slug, realm_name, character_name, character.namespace, observed, observed)).lastrowid
         def named(obj: Any) -> Any:
             return obj.get("name") if isinstance(obj, dict) else obj
         snapshot = self.db.execute("""INSERT INTO character_snapshot(character_id,archive_run_id,observed_at,level,race_id,race_name,class_id,class_name,specialization,faction,guild_name,achievement_points,last_login_if_available,raw_json_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (

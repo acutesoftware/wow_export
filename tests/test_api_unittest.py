@@ -6,6 +6,73 @@ from wow_timecapsule.api import BlizzardAPI, CharacterRef
 
 
 class BlizzardAPITests(unittest.TestCase):
+    def test_discovers_forever_character_with_surname_and_ruleset(self):
+        api = BlizzardAPI.__new__(BlizzardAPI)
+        api.region = "us"
+        api.locale = "en_US"
+        requested = []
+
+        def fake_get(path, namespace="profile"):
+            requested.append(namespace)
+            if namespace != "profile-forever":
+                return {"wow_accounts": []}, 200
+            return {"wow_accounts": [{"characters": [{
+                "ruleset": {"id": 2, "name": "Normal"},
+                "id": 716333,
+                "name": "Davina",
+                "surname": "Asaria",
+                "level": 22,
+                "playable_class": {"id": 8, "name": "Mage"},
+                "protected_character": {
+                    "href": "https://us.api.blizzard.com/profile/user/wow/"
+                            "protected-character/6855-716333?namespace=profile-forever-us"
+                },
+            }]}]}, 200
+
+        api.get = fake_get
+        characters, raw, status = api.discover_characters()
+
+        self.assertEqual(requested[-1], "profile-forever")
+        self.assertEqual(len(characters), 1)
+        character = characters[0]
+        self.assertEqual(character.display_name, "Davina Asaria")
+        self.assertEqual(character.profile_slug, "davina-asaria")
+        self.assertEqual(character.realm_name, "Normal")
+        self.assertEqual(character.namespace, "profile-forever")
+        self.assertEqual(character.protected_namespace, "profile-forever")
+        self.assertIn("profile-forever-us", raw["namespaces"])
+        self.assertEqual(status, 200)
+
+    def test_forever_capture_uses_realmless_two_part_character_path(self):
+        api = BlizzardAPI.__new__(BlizzardAPI)
+        api.region = "us"
+        api.locale = "en_US"
+        requested = []
+
+        def fake_get(path, namespace="profile"):
+            requested.append((path, namespace))
+            if path.endswith("/achievements"):
+                return {"achievements": []}, 200
+            if path.endswith("/quests/completed"):
+                return {"quests": []}, 200
+            return {}, 200
+
+        api.get = fake_get
+        character = CharacterRef(
+            "us", 2, "", "Normal", 716333, "Davina", 22,
+            "Mage", "profile-forever", 8, surname="Asaria",
+        )
+        captured = api.capture_character(character, lambda *_args: None)
+
+        forever_paths = {
+            path for path, namespace in requested
+            if namespace == "profile-forever"
+        }
+        self.assertIn("/profile/wow/character/davina-asaria", forever_paths)
+        self.assertFalse(any("/normal/" in path for path in forever_paths))
+        self.assertFalse(any(path.endswith("/hunter-pets") for path in forever_paths))
+        self.assertEqual(captured["_outcomes"]["hunter_pets"]["status"], "unavailable")
+
     def test_discovers_retail_and_classic1x_separately(self):
         api = BlizzardAPI.__new__(BlizzardAPI)
         api.region = "us"
@@ -14,6 +81,8 @@ class BlizzardAPITests(unittest.TestCase):
 
         def fake_get(path, namespace="profile"):
             requested.append(namespace)
+            if namespace == "profile-forever":
+                return {"wow_accounts": []}, 200
             if namespace == "profile-classic":
                 request = httpx.Request("GET", "https://us.api.blizzard.com/profile/user/wow")
                 response = httpx.Response(404, request=request)
@@ -38,7 +107,10 @@ class BlizzardAPITests(unittest.TestCase):
         api.get = fake_get
         characters, raw, status = api.discover_characters()
 
-        self.assertEqual(requested, ["profile", "profile-classic", "profile-classic1x"])
+        self.assertEqual(
+            requested,
+            ["profile", "profile-classic", "profile-classic1x", "profile-forever"],
+        )
         self.assertEqual([char.namespace for char in characters], ["profile", "profile-classic1x"])
         self.assertEqual(characters[1].game_version, "Classic Era / Hardcore / seasonal")
         self.assertEqual(characters[0].protected_path, "/profile/user/wow/protected-character/1-2")

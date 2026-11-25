@@ -138,11 +138,18 @@ Click any table heading to sort that column in ascending order. Click the same
 heading again for descending order. The arrow beside the heading shows the
 current direction.
 
-### Retail, Classic, and Hardcore characters
+### Retail, Classic, Hardcore, and WoW Forever characters
 
-The **Game** column identifies Retail, Classic progression, or Classic
-Era/Hardcore/seasonal characters. The application requests those Blizzard API
-namespaces separately.
+The **Game** column identifies Retail, Classic progression, Classic
+Era/Hardcore/seasonal, or WoW Forever characters. The application requests
+those Blizzard API namespaces separately. Forever characters use a first name
+and surname and a ruleset instead of a realm; the character table shows that
+ruleset in the **Realm / Ruleset** column.
+
+Forever's `profile-forever` API namespace is available but not yet included in
+Blizzard's published API documentation. Its behavior may change. Forever
+profiles currently appear from level 10 after the character logs out, and the
+hunter-pets endpoint is not exposed.
 
 Blizzard may return deleted, renamed, transferred, or stale characters in an
 account index, and newly created characters may take time to appear. A character
@@ -156,12 +163,14 @@ If automatic discovery does not list a character:
 2. Select its region.
 3. Select the game version. For Hardcore, choose **Classic Era / Hardcore /
    seasonal**.
-4. Enter the realm slug, such as `defias-pillager`.
-5. Enter the character name.
+4. For Retail or Classic, enter the realm slug, such as `defias-pillager`. For
+   WoW Forever, enter the character's surname in the same field.
+5. Enter the character's first name.
 6. Export normally.
 
-Use the lowercase URL form of the realm name rather than its display name.
-Manual entry skips discovery but still requires Battle.net authorization.
+For a realm, use its lowercase URL form rather than its display name. Forever
+names may be entered with their normal capitalization. Manual entry skips
+discovery but still requires Battle.net authorization.
 
 ## View an archive
 

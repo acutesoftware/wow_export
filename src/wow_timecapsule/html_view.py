@@ -28,6 +28,7 @@ GAME_LABELS = {
     "profile": "Retail",
     "profile-classic": "Classic progression",
     "profile-classic1x": "Classic Era / Hardcore / seasonal",
+    "profile-forever": "WoW Forever",
 }
 
 

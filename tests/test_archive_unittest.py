@@ -10,6 +10,27 @@ from wow_timecapsule.verify import verify
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_forever_character_is_archived_with_full_name_and_ruleset(self):
+        with tempfile.TemporaryDirectory() as folder:
+            archive = Archive(folder)
+            character = CharacterRef(
+                "us", 2, "", "Normal", 716333, "Davina", 22,
+                "Mage", "profile-forever", 8, surname="Asaria",
+            )
+            with archive.run(region="us", locale="en_US") as run_id:
+                archive.import_capture(
+                    run_id, character,
+                    {"character_profile": {
+                        "name": "Davina", "surname": "Asaria", "level": 22,
+                        "ruleset": {"id": 2, "name": "Normal"},
+                    }},
+                )
+            row = archive.db.execute(
+                "SELECT character_name,realm_name,namespace FROM character"
+            ).fetchone()
+            self.assertEqual(row, ("Davina Asaria", "Normal", "profile-forever"))
+            archive.close()
+
     def test_new_archive_has_character_information_tables_only(self):
         with tempfile.TemporaryDirectory() as folder:
             archive = Archive(folder)
